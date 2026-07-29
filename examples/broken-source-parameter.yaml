@@ -1,0 +1,78 @@
+# A minimal illustration of the problem this tool solves.
+#
+# This is an excerpt of a workbook spec as returned by
+#   GET /v2/workbooks/{workbookId}/spec
+# shortly after the workbook was re-pointed at a cloned data model.
+#
+# The workbook now READS FROM        22222222-2222-2222-2222-222222222222
+# but the source parameter STILL NAMES 11111111-1111-1111-1111-111111111111
+#
+# Every `parameters[].dataModelId` below is stale. Note that they all share the
+# same stale id — that is the normal case, and why the repair is one rewrite.
+
+schemaVersion: 1
+pages:
+  - id: pAgE123456
+    name: Page 1
+    elements:
+      # ---------------------------------------------------------------- control
+      - kind: control
+        controlId: RegionControl
+        id: aBcDeFgHiJcon
+        name: Region
+        controlType: list
+        mode: include
+        selectionMode: multiple
+        values: []
+        # Filters the in-workbook table directly. Unaffected by a source swap.
+        filters:
+          - source:
+              kind: table
+              elementId: KLm0nOpQrS
+            columnId: TuVwXyZ012
+        # Drives a control inside the data model. BROKEN by the source swap.
+        parameters:
+          - kind: data-model
+            dataModelId: 11111111-1111-1111-1111-111111111111   # <-- stale
+            controlId: Store-Region
+        source:
+          kind: source
+          source:
+            kind: table
+            elementId: KLm0nOpQrS
+          columnId: TuVwXyZ012
+
+      # A second control, broken the same way.
+      - kind: control
+        controlId: CityControl
+        id: bCdEfGhIjKcon
+        name: City
+        controlType: list
+        mode: include
+        selectionMode: multiple
+        values: []
+        parameters:
+          - kind: data-model
+            dataModelId: 11111111-1111-1111-1111-111111111111   # <-- stale
+            controlId: Store-City
+
+      # ------------------------------------------------------------------ table
+      # The swap DID update this element, which is why the data still loads
+      # while the controls sit broken.
+      - id: KLm0nOpQrS
+        kind: table
+        source:
+          kind: data-model
+          dataModelId: 22222222-2222-2222-2222-222222222222      # <-- current
+          elementId: eLeMeNt01
+        columns:
+          - id: TuVwXyZ012
+            formula: '[Store/Store Region]'
+          - id: TuVwXyZ013
+            formula: '[Store/Store City]'
+        order:
+          - TuVwXyZ012
+          - TuVwXyZ013
+
+# After `repair --apply`, both `parameters[].dataModelId` values above read
+# 22222222-2222-2222-2222-222222222222 and nothing else changes.
