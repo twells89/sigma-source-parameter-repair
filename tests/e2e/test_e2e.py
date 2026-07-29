@@ -12,9 +12,11 @@ everything it made:
   2. build a workbook bound to the original model's controls
   3. `swapSources` the workbook onto the clone — reproducing the real breakage
   4. assert `check` reports the mixed outcome: repairable + one NO MATCH
-  5. assert `repair --apply` without a mapping fixes only what it can verify
-  6. assert `repair --map OLD=NEW --apply` fixes the renamed one too
-  7. assert the result is idempotent and validates server-side
+  5. assert `repair --apply` refuses to write while anything is unresolved
+  6. assert one `--map` unblocks every binding atomically, and is idempotent
+  7. assert the result validates server-side
+  8. assert a control retargeted at a different element reports MISMATCH,
+     suggests the compatible control, and repairs via that suggestion
 
 Usage:
     export SIGMA_BASE_URL=... SIGMA_CLIENT_ID=... SIGMA_CLIENT_SECRET=...
@@ -112,9 +114,48 @@ def build_renamed_clone(client: SigmaClient, source_spec: dict, victim: str,
     return dm_id
 
 
+def dm_control_details(dm_spec: dict) -> dict[str, tuple[str | None, str | None]]:
+    """Control id -> (element it filters, column it filters on)."""
+    out: dict[str, tuple[str | None, str | None]] = {}
+    for page in dm_spec.get("pages", []):
+        for element in iter_elements(page.get("elements")):
+            if element.get("kind") != "control" or not element.get("controlId"):
+                continue
+            target = column = None
+            for filt in element.get("filters") or []:
+                target = (filt.get("source") or {}).get("elementId")
+                column = filt.get("columnId")
+                if target:
+                    break
+            out[element["controlId"]] = (target, column)
+    return out
+
+
 def build_workbook(client: SigmaClient, dm_id: str, element_id: str,
-                   control_ids: list[str], folder_id: str) -> str:
-    """A workbook with one table plus one control bound to each DM control."""
+                   control_ids: list[str], folder_id: str,
+                   source_spec: dict) -> str:
+    """A workbook with one table plus one control bound to each DM control.
+
+    The controls carry a real `source`, mirroring how Sigma authors them, and
+    each one reads the same column its target data-model control filters on.
+    Without that, the workbook does not exercise compatibility checking at all.
+    """
+    dm_element = next(
+        e for page in source_spec["pages"]
+        for e in iter_elements(page["elements"])
+        if e.get("id") == element_id
+    )
+    # Workbook columns get their own ids but reuse the data model's formulas.
+    formula_to_wb_column, columns = {}, []
+    for index, column in enumerate(dm_element.get("columns") or []):
+        wb_column_id = f"e2eCol{index:02d}"
+        columns.append({"id": wb_column_id, "formula": column["formula"]})
+        formula_to_wb_column[column["formula"]] = wb_column_id
+    dm_column_formula = {
+        c["id"]: c["formula"] for c in (dm_element.get("columns") or [])
+    }
+    details = dm_control_details(source_spec)
+
     table_id = "e2eTable01"
     elements: list[dict] = [
         {
@@ -122,26 +163,34 @@ def build_workbook(client: SigmaClient, dm_id: str, element_id: str,
             "kind": "table",
             "source": {"kind": "data-model", "dataModelId": dm_id,
                        "elementId": element_id},
-            "columns": [],
+            "columns": columns,
+            "order": [c["id"] for c in columns],
         }
     ]
     for index, control_id in enumerate(control_ids):
-        elements.append(
-            {
-                "kind": "control",
-                "id": f"e2eCtl{index:02d}con",
-                "controlId": f"E2EControl{index:02d}",
-                "name": control_id,
-                "controlType": "list",
-                "mode": "include",
-                "selectionMode": "multiple",
-                "values": [],
-                "parameters": [
-                    {"kind": "data-model", "dataModelId": dm_id,
-                     "controlId": control_id}
-                ],
+        _, dm_column = details.get(control_id, (None, None))
+        wb_column = formula_to_wb_column.get(dm_column_formula.get(dm_column))
+        control: dict = {
+            "kind": "control",
+            "id": f"e2eCtl{index:02d}con",
+            "controlId": f"E2EControl{index:02d}",
+            "name": control_id,
+            "controlType": "list",
+            "mode": "include",
+            "selectionMode": "multiple",
+            "values": [],
+            "parameters": [
+                {"kind": "data-model", "dataModelId": dm_id,
+                 "controlId": control_id}
+            ],
+        }
+        if wb_column:
+            control["source"] = {
+                "kind": "source",
+                "source": {"kind": "table", "elementId": table_id},
+                "columnId": wb_column,
             }
-        )
+        elements.append(control)
     body = {
         "name": f"{PREFIX}-workbook-{int(time.time())}",
         "folderId": folder_id,
@@ -154,6 +203,50 @@ def build_workbook(client: SigmaClient, dm_id: str, element_id: str,
     )
     _created.append(("workbook", wb_id))
     return wb_id
+
+
+def build_retargeted_clone(client: SigmaClient, source_spec: dict, victim: str,
+                           new_target_element: str, folder_id: str) -> str:
+    """Clone a data model, re-pointing one control at a different element.
+
+    Produces the mis-wiring that cannot be authored directly — Sigma rejects a
+    workbook whose control reads one element while its parameter targets a
+    control filtering another — so it has to be reached via a source swap.
+    """
+    spec = json.loads(json.dumps(source_spec))
+    # A column of the new target element, so the retargeted control stays valid.
+    column = next(
+        c["id"]
+        for page in spec["pages"]
+        for e in iter_elements(page["elements"])
+        if e.get("id") == new_target_element
+        for c in (e.get("columns") or [])
+    )
+    for page in spec.get("pages", []):
+        for element in iter_elements(page.get("elements")):
+            if element.get("kind") != "control" or element.get("controlId") != victim:
+                continue
+            element["filters"] = [
+                {"source": {"kind": "table", "elementId": new_target_element},
+                 "columnId": column}
+            ]
+            element["source"] = {
+                "kind": "source",
+                "source": {"kind": "table", "elementId": new_target_element},
+                "columnId": column,
+            }
+    body = {
+        "name": f"{PREFIX}-retargeted-{int(time.time())}",
+        "folderId": folder_id,
+        "schemaVersion": spec["schemaVersion"],
+        "pages": spec["pages"],
+    }
+    created = client._call("POST", "/v2/dataModels/spec", body)
+    dm_id = created_id(created, "dataModelId") or _find_inode(
+        client, body["name"], "dataModels"
+    )
+    _created.append(("data model", dm_id))
+    return dm_id
 
 
 def created_id(response: Any, key: str) -> str | None:
@@ -306,7 +399,8 @@ def main() -> int:
             client, source_spec, victim, renamed, folder_id
         )
         print(f"  created clone data model {clone_dm}")
-        wb_id = build_workbook(client, source_dm, table_element, used, folder_id)
+        wb_id = build_workbook(client, source_dm, table_element, used, folder_id,
+                               source_spec)
         print(f"  created workbook {wb_id}")
 
         print("\n1. a freshly built workbook is healthy")
@@ -413,6 +507,60 @@ def main() -> int:
             check("Sigma accepts the repaired spec", True)
         except SigmaError as exc:
             check("Sigma accepts the repaired spec", False, str(exc))
+
+        print("\n7. a control filtering the wrong element is a MISMATCH")
+        others = [el for el in grouped if el != table_element and grouped[el]]
+        if not others:
+            print("  SKIP  the source data model has controls on only one "
+                  "element, so this case cannot be built here")
+        else:
+            other_element = others[0]
+            victim2 = keepers[0]
+            print(f"  re-pointing {victim2} at element {other_element}")
+            retargeted = build_retargeted_clone(
+                client, source_spec, victim2, other_element, folder_id
+            )
+            wb2 = build_workbook(
+                client, source_dm, table_element, [victim2], folder_id, source_spec
+            )
+            # Valid until the swap moves the control's target out from under it.
+            code, payload = run_cli("check", wb2)
+            check("the mis-wiring is not detectable before the swap", code == 0,
+                  json.dumps(statuses(payload)))
+
+            swap_workbook_source(client, wb2, source_dm, retargeted, [table_element])
+            code, payload = run_cli("check", wb2)
+            found2 = statuses(payload)
+            check("check exits 1", code == 1, f"exit={code}")
+            check("reported as element-mismatch, not repairable",
+                  found2.get(victim2) == "element-mismatch", json.dumps(found2))
+
+            finding = payload["findings"][0]
+            check("it names the element the control actually reads",
+                  finding["readsDataModelElement"] is not None,
+                  json.dumps(finding))
+            check("it suggests a control filtering the right element",
+                  bool(finding["suggestedControlIds"]),
+                  json.dumps(finding["suggestedControlIds"]))
+            check("every suggestion really filters that element",
+                  all(s in grouped[table_element]
+                      for s in finding["suggestedControlIds"]),
+                  f"suggested={finding['suggestedControlIds']} "
+                  f"valid={grouped[table_element]}")
+
+            code, payload = run_cli("repair", wb2, "--apply")
+            check("repair refuses to write a mismatch", code == 1, f"exit={code}")
+            check("nothing was written", payload.get("applied") is False,
+                  f"applied={payload.get('applied')}")
+
+            suggestion = finding["suggestedControlIds"][0]
+            code, payload = run_cli(
+                "repair", wb2, "--map", f"{victim2}={suggestion}", "--apply"
+            )
+            check("the suggested mapping repairs it", code == 0, f"exit={code}")
+            check("nothing needs attention any more",
+                  payload["stillNeedingAttention"] == 0,
+                  f"remaining={payload['stillNeedingAttention']}")
 
     finally:
         cleanup(client)
