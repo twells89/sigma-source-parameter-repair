@@ -22,7 +22,8 @@ workbook actually reads from now.
 Sigma validates both halves of a binding and matches control ids *exactly*, so a
 binding can only be repaired to a control that genuinely exists. Where the tool
 cannot determine the right target on its own — a control renamed between template
-and clone, or several live models defining the same control id — supply the
+and clone, a control that filters a different element than the workbook control
+reads from, or several live models defining the same control id — supply the
 missing knowledge with `--map` and `--data-model` rather than letting it guess.
 
 Stdlib only — no dependencies.
@@ -33,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -40,7 +42,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Exit codes, chosen so `check` works as a CI gate.
 EXIT_OK = 0
@@ -84,15 +86,48 @@ class SourceParameter:
     dm_control_id: str
     raw: dict = field(repr=False, compare=False)
     """The live dict inside the spec — mutate it to apply a repair in place."""
+    source_dm_element_id: str | None = None
+    """The data-model element this control reads its values from, if known.
+
+    Sigma requires a source parameter to target a data-model control that
+    filters this same element, so it is what makes a binding *compatible* rather
+    than merely well-formed.
+    """
+
+
+def workbook_element_sources(spec: dict) -> dict[str, str]:
+    """Workbook element id -> the data-model element it reads."""
+    sources = {}
+    for page in spec.get("pages") or []:
+        for element in iter_elements(page.get("elements")):
+            source = element.get("source") or {}
+            if source.get("kind") == "data-model" and element.get("id"):
+                if source.get("elementId"):
+                    sources[element["id"]] = source["elementId"]
+    return sources
+
+
+def _control_value_source(control: dict) -> str | None:
+    """The workbook element a control reads its values from.
+
+    Only `source` counts. A control's `filters` may well target a different
+    element — that is the element it *filters*, not the one it draws values from
+    — and it is the value source that Sigma validates the parameter against.
+    """
+    source = control.get("source") or {}
+    inner = source.get("source") or {}
+    return inner.get("elementId")
 
 
 def find_source_parameters(spec: dict) -> list[SourceParameter]:
     """Collect every data-model source parameter in a workbook spec."""
+    element_sources = workbook_element_sources(spec)
     found: list[SourceParameter] = []
     for page in spec.get("pages") or []:
         for element in iter_elements(page.get("elements")):
             if element.get("kind") != "control":
                 continue
+            value_source = _control_value_source(element)
             for param in element.get("parameters") or []:
                 if not isinstance(param, dict) or param.get("kind") != "data-model":
                     continue
@@ -105,25 +140,40 @@ def find_source_parameters(spec: dict) -> list[SourceParameter]:
                         data_model_id=param.get("dataModelId", ""),
                         dm_control_id=param.get("controlId", ""),
                         raw=param,
+                        source_dm_element_id=element_sources.get(value_source),
                     )
                 )
     return found
 
 
-def data_model_control_ids(dm_spec: dict) -> set[str]:
-    """The set of controlIds a data model defines."""
-    ids = set()
+def data_model_control_targets(dm_spec: dict) -> dict[str, str | None]:
+    """Control id -> the data-model element that control filters."""
+    targets: dict[str, str | None] = {}
     for page in dm_spec.get("pages") or []:
         for element in iter_elements(page.get("elements")):
-            if element.get("kind") == "control" and element.get("controlId"):
-                ids.add(element["controlId"])
-    return ids
+            if element.get("kind") != "control" or not element.get("controlId"):
+                continue
+            target = None
+            for filt in element.get("filters") or []:
+                target = (filt.get("source") or {}).get("elementId")
+                if target:
+                    break
+            if target is None:
+                target = _control_value_source(element)
+            targets[element["controlId"]] = target
+    return targets
+
+
+def data_model_control_ids(dm_spec: dict) -> set[str]:
+    """The set of controlIds a data model defines."""
+    return set(data_model_control_targets(dm_spec))
 
 
 HEALTHY = "healthy"
 REPAIRABLE = "repairable"
 AMBIGUOUS = "ambiguous"
 MISSING_CONTROL = "missing-control"
+MISMATCH = "element-mismatch"
 
 
 @dataclass
@@ -134,6 +184,7 @@ class Finding:
     new_control_id: str | None = None
     reason: str = ""
     available_control_ids: tuple[str, ...] = ()
+    suggested_control_ids: tuple[str, ...] = ()
 
     @property
     def needs_attention(self) -> bool:
@@ -152,6 +203,8 @@ class Finding:
             "newDataModelControlId": self.new_control_id,
             "reason": self.reason,
             "availableControlIds": list(self.available_control_ids),
+            "suggestedControlIds": list(self.suggested_control_ids),
+            "readsDataModelElement": p.source_dm_element_id,
         }
 
 
@@ -198,10 +251,97 @@ def load_control_map_file(text: str) -> dict[str, str]:
     return parse_control_map(lines)
 
 
+def _name_stem(control_id: str) -> str:
+    """The trailing word of a control id, for ranking suggestions by likeness.
+
+    `Store-City` and `Cust-City` share the stem "city". Used only to order and
+    phrase suggestions — never to rebind anything automatically.
+    """
+    parts = [p for p in re.split(r"[^0-9A-Za-z]+", control_id) if p]
+    return parts[-1].lower() if parts else control_id.lower()
+
+
+def _rank_suggestions(target_control: str, suggestions: Iterable[str]) -> tuple:
+    """Order suggestions so same-stem candidates come first."""
+    stem = _name_stem(target_control)
+    return tuple(sorted(suggestions, key=lambda c: (_name_stem(c) != stem, c)))
+
+
+def _mismatch(
+    parameter: SourceParameter,
+    target_control: str,
+    target_element: str | None,
+    suggestions: tuple[str, ...],
+) -> Finding:
+    """A control that exists but filters the wrong element."""
+    ranked = _rank_suggestions(target_control, suggestions)
+    stem = _name_stem(target_control)
+    likely = [c for c in ranked if _name_stem(c) == stem]
+
+    reason = (
+        f"this control reads values from data model element "
+        f"{parameter.source_dm_element_id}, but {target_control!r} filters "
+        f"{target_element} — Sigma rejects that pairing"
+    )
+    if len(likely) == 1:
+        reason += (
+            f". Did you mean {likely[0]!r}? "
+            f"--map {parameter.dm_control_id}={likely[0]}"
+        )
+    elif len(ranked) == 1:
+        reason += (
+            f". Did you mean {ranked[0]!r}? "
+            f"--map {parameter.dm_control_id}={ranked[0]}"
+        )
+    elif ranked:
+        reason += (
+            f". Controls filtering the right element: {', '.join(ranked)} — "
+            f"pick one with --map {parameter.dm_control_id}=..."
+        )
+    else:
+        reason += (
+            ". No control filters that element, so either re-point this "
+            "control's value source or add a matching control to the data model"
+        )
+    return Finding(
+        parameter, MISMATCH, reason=reason, suggested_control_ids=ranked
+    )
+
+
+def _normalize_controls(
+    controls_by_data_model: dict[str, Any],
+) -> dict[str, dict[str, str | None]]:
+    """Accept either a set of control ids or a control-id -> target-element map.
+
+    A bare set carries no target information, so compatibility checking is
+    skipped for that data model rather than guessed at.
+    """
+    normalized: dict[str, dict[str, str | None]] = {}
+    for data_model_id, controls in (controls_by_data_model or {}).items():
+        if isinstance(controls, dict):
+            normalized[data_model_id] = dict(controls)
+        else:
+            normalized[data_model_id] = {control: None for control in controls}
+    return normalized
+
+
+def _compatible(
+    parameter: SourceParameter, target: str | None
+) -> bool | None:
+    """Whether a data-model control can serve this workbook control.
+
+    Returns None when either side's element is unknown, meaning "cannot tell" —
+    the caller must not treat that as a failure.
+    """
+    if parameter.source_dm_element_id is None or target is None:
+        return None
+    return parameter.source_dm_element_id == target
+
+
 def plan_repairs(
     parameters: list[SourceParameter],
     live_data_model_ids: list[str],
-    controls_by_data_model: dict[str, set[str]],
+    controls_by_data_model: dict[str, Any],
     control_renames: dict[str, str] | None = None,
     preferred_data_model_id: str | None = None,
 ) -> list[Finding]:
@@ -218,18 +358,40 @@ def plan_repairs(
     same control id.
     """
     renames = control_renames or {}
+    controls = _normalize_controls(controls_by_data_model)
     findings: list[Finding] = []
     all_available = tuple(
-        sorted({c for dm in live_data_model_ids for c in controls_by_data_model.get(dm, set())})
+        sorted({c for dm in live_data_model_ids for c in controls.get(dm, {})})
     )
+
+    def suggestions_for(param: SourceParameter, data_model_ids: list[str]) -> tuple:
+        """Control ids in these models that filter the element the control reads."""
+        if param.source_dm_element_id is None:
+            return ()
+        return tuple(sorted({
+            control
+            for data_model_id in data_model_ids
+            for control, target in controls.get(data_model_id, {}).items()
+            if target == param.source_dm_element_id
+        }))
 
     for param in parameters:
         target_control = renames.get(param.dm_control_id, param.dm_control_id)
         was_renamed = target_control != param.dm_control_id
         current_is_live = param.data_model_id in live_data_model_ids
-        current_defines_target = target_control in controls_by_data_model.get(
-            param.data_model_id, set()
-        )
+        current_controls = controls.get(param.data_model_id, {})
+        current_defines_target = target_control in current_controls
+
+        # The model is right and defines the control, but the control filters a
+        # different element than this control reads from — Sigma rejects that.
+        if current_is_live and current_defines_target:
+            fit = _compatible(param, current_controls.get(target_control))
+            if fit is False:
+                findings.append(_mismatch(
+                    param, target_control, current_controls.get(target_control),
+                    suggestions_for(param, [param.data_model_id]),
+                ))
+                continue
 
         # Already correct, and no rename asked for.
         if current_is_live and current_defines_target and not was_renamed:
@@ -249,11 +411,20 @@ def plan_repairs(
             )
             continue
 
+        defining = [dm for dm in live_data_model_ids if target_control in controls.get(dm, {})]
+        # Only models where the control is also compatible can actually be used.
         candidates = [
-            dm
-            for dm in live_data_model_ids
-            if target_control in controls_by_data_model.get(dm, set())
+            dm for dm in defining
+            if _compatible(param, controls.get(dm, {}).get(target_control)) is not False
         ]
+
+        if defining and not candidates:
+            findings.append(_mismatch(
+                param, target_control,
+                controls.get(defining[0], {}).get(target_control),
+                suggestions_for(param, defining),
+            ))
+            continue
 
         if preferred_data_model_id and preferred_data_model_id in candidates:
             findings.append(
@@ -323,7 +494,7 @@ def blocking_findings(findings: list[Finding]) -> list[Finding]:
     fails the whole PUT and nothing changes. Every binding therefore has to be
     resolvable before writing is attempted.
     """
-    return [f for f in findings if f.status in (AMBIGUOUS, MISSING_CONTROL)]
+    return [f for f in findings if f.status in (AMBIGUOUS, MISSING_CONTROL, MISMATCH)]
 
 
 def apply_repairs(findings: list[Finding]) -> int:
@@ -460,6 +631,7 @@ _LABEL = {
     REPAIRABLE: "REPAIR   ",
     AMBIGUOUS: "AMBIGUOUS",
     MISSING_CONTROL: "NO MATCH ",
+    MISMATCH: "MISMATCH ",
 }
 
 
@@ -474,7 +646,9 @@ def analyze(
     live = [s["dataModelId"] for s in sources if s.get("type") == "data-model"]
     parameters = find_source_parameters(spec)
     controls = {
-        data_model_id: data_model_control_ids(client.get_data_model_spec(data_model_id))
+        data_model_id: data_model_control_targets(
+            client.get_data_model_spec(data_model_id)
+        )
         for data_model_id in live
     }
     findings = plan_repairs(
@@ -510,6 +684,9 @@ def _print_report(spec: dict, live: list[str], findings: list[Finding]) -> None:
         if finding.status == MISSING_CONTROL and finding.available_control_ids:
             print(f"             controls available: "
                   f"{', '.join(finding.available_control_ids)}")
+        if finding.status == MISMATCH and finding.parameter.source_dm_element_id:
+            print(f"             reads element: "
+                  f"{finding.parameter.source_dm_element_id}")
         print()
 
 
@@ -593,6 +770,17 @@ def cmd_repair(client: SigmaClient, args: argparse.Namespace) -> int:
             print("Resolve the remaining binding(s) with --map "
                   "OLD_CONTROL_ID=NEW_CONTROL_ID (or --data-model to pick "
                   "between sources), then run again.")
+            hints = [
+                f"  --map {f.parameter.dm_control_id}={f.suggested_control_ids[0]}"
+                for f in unresolved
+                if f.suggested_control_ids
+                and _name_stem(f.suggested_control_ids[0])
+                == _name_stem(f.parameter.dm_control_id)
+            ]
+            if hints:
+                print("\nSuggested:")
+                for hint in dict.fromkeys(hints):
+                    print(hint)
             if repairable:
                 print(f"\n{len(repairable)} other binding(s) are ready and will "
                       f"be written in the same pass once the rest resolve.")

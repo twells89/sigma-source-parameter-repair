@@ -111,20 +111,48 @@ unresolved, instead of attempting a write that cannot succeed.
 This is why the escape hatches matter: `--map` and `--data-model` are not
 conveniences, they are what unblocks the write.
 
-## A binding must be in scope
+## The two halves of a binding must agree on an element
 
-A source parameter can only target a data-model control whose own target element
-the workbook includes. Say a data model defines `Store-City` filtering its
-`Store` element and `Customer-City` filtering its `Customer` element. A workbook
-that reads only the `Store` element cannot bind to `Customer-City`:
+A source parameter is only valid when the data-model control it targets filters
+the *same* data-model element that the workbook control reads its values from.
+Merely having that element somewhere in the workbook is not enough.
+
+Concretely, given a workbook control:
+
+```yaml
+- kind: control
+  id: aBcDeFgHiJcon
+  source:                                   # where it reads its values
+    kind: source
+    source: { kind: table, elementId: wbCustomerTable }
+    columnId: TuVwXyZ013
+  parameters:
+    - kind: data-model
+      dataModelId: 22222222-2222-2222-2222-222222222222
+      controlId: Store-City                 # filters the Store element
+```
+
+If `wbCustomerTable` reads the model's `Customer` element while `Store-City`
+filters its `Store` element, the binding is rejected — even though the workbook
+may also contain a table reading `Store`:
 
 ```
 Invalid parameter on control: aBcDeFgHiJcon targeting data model: 22222222-2222-2222-2222-222222222222, controlId: Customer-City.
 ```
 
-The message looks identical to the stale-model case, so when a binding is
-rejected for a data model that demonstrably defines that control, check whether
-the workbook actually includes the element the control filters.
+Note that a control's `source` and its `filters` routinely name *different*
+elements: `filters` is what the control filters inside the workbook, `source` is
+where its value list comes from. **Only `source` matters here.** Reading
+`filters` instead will point at the wrong element and produce false diagnoses.
+
+This is indistinguishable by message from the stale-model case, which makes it
+easy to misread: the model id in the error may be entirely correct and the
+control may genuinely exist. `plan_repairs` therefore compares the two elements
+itself and reports `element-mismatch`, naming the element the control reads and
+suggesting the controls that filter it — ranked so a control sharing the same
+trailing word (`Store-City` → `Cust-City`) comes first. That ranking only
+orders and phrases a suggestion; nothing is ever rebound automatically on the
+strength of a name.
 
 ## Nested elements
 

@@ -115,12 +115,32 @@ For anything else, the tool picks a target:
 
 | Situation | Result |
 | --- | --- |
-| Live source, and it defines the control | `ok` — left alone |
-| Exactly one live source defines a control with that id | `REPAIR` — rewritten to that source |
+| Live source, defines the control, and filters the right element | `ok` — left alone |
+| Exactly one live source defines a compatible control with that id | `REPAIR` — rewritten to that source |
 | Several live sources define that control id | `AMBIGUOUS` — needs `--data-model` |
 | No live source defines that control id | `NO MATCH` — needs `--map` |
+| The control exists but filters a different element | `MISMATCH` — needs `--map` |
 
-The last two are deliberate. If a control was renamed or removed in the new data model, the correct target is a judgement call about intent, and quietly rebinding it to something plausible would be worse than saying so.
+The last three are deliberate. If a control was renamed, removed, or points at the wrong element, the correct target is a judgement call about intent, and quietly rebinding it to something plausible would be worse than saying so.
+
+### Element mismatch
+
+A binding needs more than a control that exists. The data-model control must filter the **same element the workbook control reads its values from**. A control drawing its values from a Customers table cannot drive a control that filters Stores, and Sigma rejects the pairing with the same message it uses for a stale model id — which makes it easy to misread as a tool failure.
+
+`MISMATCH` catches that before the write and names the likely target:
+
+```
+[MISMATCH ] 'City'  (element aBcDeFgHiJcon)
+             data model control: Store-City
+             this control reads values from data model element customerElement1,
+             but 'Store-City' filters storeElement01 — Sigma rejects that pairing.
+             Did you mean 'Cust-City'? --map Store-City=Cust-City
+             reads element: customerElement1
+```
+
+Suggestions are the controls that actually filter the right element, ranked so one sharing the same trailing word comes first. That is a hint for you to confirm, never an automatic rebinding.
+
+If the control was instead meant to filter the *other* element, the fix is not a mapping — re-point its value source in Sigma, then run a plain repair.
 
 Repairs are idempotent — running twice is a no-op.
 
