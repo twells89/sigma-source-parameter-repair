@@ -36,7 +36,7 @@ If it cannot confirm that, it refuses to guess. See [Resolution rules](#resoluti
 ## Install
 
 ```sh
-git clone https://github.com/OWNER/sigma-source-parameter-repair.git
+git clone https://github.com/twells89/sigma-source-parameter-repair.git
 cd sigma-source-parameter-repair
 ```
 
