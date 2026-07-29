@@ -87,7 +87,7 @@ source parameters: 3
 3 source parameter(s) need attention.
 ```
 
-Add `--json` for machine-readable output.
+Add `--json` for machine-readable output (available on `repair` too).
 
 ### Repair
 
@@ -109,42 +109,92 @@ After writing, the tool re-reads the workbook and reports how many bindings stil
 
 ## Resolution rules
 
-For each source parameter whose `dataModelId` is not among the workbook's live data-model sources, the tool picks a target:
+A binding is healthy only when its data model is a live source **and** that model really defines the referenced control. Sigma validates both halves and matches control ids exactly, so a stale control id is just as broken as a stale model id.
+
+For anything else, the tool picks a target:
 
 | Situation | Result |
 | --- | --- |
-| Already points at a live source | `ok` — left alone |
+| Live source, and it defines the control | `ok` — left alone |
 | Exactly one live source defines a control with that id | `REPAIR` — rewritten to that source |
-| Several live sources define that control id | `AMBIGUOUS` — left alone, reported |
-| No live source defines that control id | `NO MATCH` — left alone, reported |
+| Several live sources define that control id | `AMBIGUOUS` — needs `--data-model` |
+| No live source defines that control id | `NO MATCH` — needs `--map` |
 
-The last two are deliberate. If a control was renamed or removed in the new data model, the correct target is a judgement call about intent, and quietly rebinding it to something plausible would be worse than saying so. `--apply` repairs what it can confirm, leaves the rest untouched, and exits non-zero so you know work remains.
+The last two are deliberate. If a control was renamed or removed in the new data model, the correct target is a judgement call about intent, and quietly rebinding it to something plausible would be worse than saying so.
 
 Repairs are idempotent — running twice is a no-op.
+
+### Repair is all-or-nothing
+
+Sigma validates an entire spec on write, so a **partial repair cannot be saved**: one unresolved binding rejects the whole `PUT` and nothing changes. `repair --apply` therefore checks first and refuses to write while anything is unresolved, rather than attempting a doomed write:
+
+```
+Cannot write: 1 binding(s) could not be resolved.
+Sigma validates the whole spec on write, so a partial repair cannot be saved —
+an unresolved binding would reject the write and nothing would change.
+Resolve the remaining binding(s) with --map OLD_CONTROL_ID=NEW_CONTROL_ID
+(or --data-model to pick between sources), then run again.
+
+2 other binding(s) are ready and will be written in the same pass once the rest resolve.
+```
+
+Supply the missing mapping and every binding is repaired together in one atomic version.
+
+## Resolving what the tool cannot infer
+
+Two flags exist to supply knowledge the tool has no way to derive. Both apply to `check` as well as `repair`, so you can see the effect before writing.
+
+**A control was renamed** between template and clone. Only you know `Store-City` became `Store-Municipality`:
+
+```sh
+python3 sigma_source_params.py repair WORKBOOK_ID \
+  --map Store-City=Store-Municipality \
+  --map Store-Region=Store-District --apply
+```
+
+For many renames, keep them in a file — either a JSON object or `OLD=NEW` lines with `#` comments:
+
+```sh
+python3 sigma_source_params.py repair WORKBOOK_ID --map-file renames.txt --apply
+```
+
+A mapping is not a licence to invent: if the mapped-to control does not exist either, the binding stays `NO MATCH`.
+
+**Several live sources define the same control id.** Pick one:
+
+```sh
+python3 sigma_source_params.py repair WORKBOOK_ID --data-model DATA_MODEL_ID --apply
+```
+
+`--data-model` selects among *valid* candidates. It cannot force a binding onto a model that lacks the control.
+
+> Control id matching is **exact** — case- and separator-sensitive. `store-city`, `Store_City` and `Store-City` are three different controls to Sigma, and only the precise one is accepted. Worth knowing that `swapSources` *does* normalise case and punctuation when auto-matching columns; parameters get no such grace.
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | `0` | Nothing needs attention (or a dry run completed) |
-| `1` | Stale bindings found, or some could not be resolved automatically |
-| `2` | Missing or invalid credentials |
+| `1` | Stale bindings found, or the write was blocked by an unresolved binding |
+| `2` | Missing credentials, or a malformed `--map` argument |
 | `3` | The Sigma API returned an error |
 
 ## Use it as a rollout gate
 
-The durable pattern for template-based provisioning is to make the repair part of the pipeline instead of something a human remembers:
+The durable pattern for template-based provisioning is to make the repair part of the pipeline instead of something a human remembers. Because a repair is atomic, one command either fixes everything or changes nothing:
 
 ```sh
 # 1. clone the template data model
 # 2. clone the template workbook
 # 3. swap the new workbook onto the new data model
-# 4. repair the source parameters that step 3 could not carry over
-python3 sigma_source_params.py repair "$NEW_WORKBOOK_ID" --apply
 
-# 5. fail the rollout if anything is still unresolved
-python3 sigma_source_params.py check "$NEW_WORKBOOK_ID"
+# 4. repair the source parameters that step 3 could not carry over.
+#    Exits non-zero and writes nothing if any binding needs a human decision,
+#    so the rollout stops rather than shipping a half-wired workbook.
+python3 sigma_source_params.py repair "$NEW_WORKBOOK_ID" --apply
 ```
+
+If your template renames controls between versions, keep the renames in a file next to the pipeline and pass `--map-file` so the rollout stays hands-off.
 
 ## A useful side effect
 
@@ -162,6 +212,7 @@ So a spec that writes cleanly has no broken source parameters. Note that `GET` d
 ## Limitations
 
 - Only `kind: data-model` parameters are handled. Other parameter kinds are ignored.
+- A source parameter can only bind to a data-model control whose target element the workbook itself includes. Sigma rejects a binding to a control that filters an element the workbook does not use.
 - Workbook spec endpoints are a Sigma **beta** API and may change.
 - The tool verifies the repair at the API layer. It cannot click your dashboard for you — open the workbook to confirm the controls behave as you expect.
 
@@ -180,6 +231,16 @@ python3 -m unittest discover -s tests -v
 ```
 
 The spec-analysis core is pure and fully unit tested with no network access; please keep it that way and add a case alongside any behaviour change.
+
+There is also an end-to-end test that runs against a real Sigma organization. It is not part of CI, because it needs credentials and creates and deletes real documents. Run it before releasing a change to resolution logic or the API client:
+
+```sh
+export SIGMA_BASE_URL=... SIGMA_CLIENT_ID=... SIGMA_CLIENT_SECRET=...
+export SIGMA_E2E_DATA_MODEL_ID=<a data model with 2+ controls on one element>
+python3 tests/e2e/test_e2e.py
+```
+
+It clones a data model with one control deliberately renamed, builds a workbook against the original, breaks it with a real `swapSources` call, and asserts the whole flow through to an atomic repair. It removes everything it creates, including sweeping strays by name if a run dies midway.
 
 ## License
 
