@@ -100,6 +100,32 @@ This makes the write path a reliable oracle for whether a workbook's source para
 
 `GET` does not validate. It returns stale bindings without complaint, so read-back alone cannot tell you a workbook is healthy — it only tells you what the workbook currently claims.
 
+## Writes are all-or-nothing
+
+Because validation covers the whole spec, there is no way to persist a partial
+repair. If a spec contains one binding that cannot be resolved, the `PUT` is
+rejected and *none* of the other rewrites land either. The tool therefore
+classifies every binding first and refuses to write while any of them is
+unresolved, instead of attempting a write that cannot succeed.
+
+This is why the escape hatches matter: `--map` and `--data-model` are not
+conveniences, they are what unblocks the write.
+
+## A binding must be in scope
+
+A source parameter can only target a data-model control whose own target element
+the workbook includes. Say a data model defines `Store-City` filtering its
+`Store` element and `Customer-City` filtering its `Customer` element. A workbook
+that reads only the `Store` element cannot bind to `Customer-City`:
+
+```
+Invalid parameter on control: aBcDeFgHiJcon targeting data model: 22222222-2222-2222-2222-222222222222, controlId: Customer-City.
+```
+
+The message looks identical to the stale-model case, so when a binding is
+rejected for a data model that demonstrably defines that control, check whether
+the workbook actually includes the element the control filters.
+
 ## Nested elements
 
 Controls are often nested inside container elements, and containers can nest arbitrarily. A flat iteration over `page["elements"]` silently misses them, which in this problem space means silently under-reporting broken parameters. `iter_elements()` walks the tree, descending through both `elements` and `children`.
