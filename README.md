@@ -1,6 +1,6 @@
 # sigma-source-parameter-repair
 
-Detect and repair broken **source parameters** in [Sigma](https://www.sigmacomputing.com/) workbooks after a source swap.
+Detect and repair broken **source parameters** in [Sigma](https://www.sigmacomputing.com/) workbooks **and data models** after a source swap.
 
 If you use a template data model plus a template workbook and clone them for each new team, tenant, or environment, you have probably hit this: you swap the new workbook onto the new data model, and every source parameter goes invalid at once. This tool fixes them in a single pass.
 
@@ -8,7 +8,7 @@ No dependencies — Python 3.9+ standard library only.
 
 ## The problem
 
-A workbook control can drive a control defined inside a data model. That binding is called a *source parameter*, and in the workbook spec it looks like this:
+A control — in a workbook or in a data model — can drive a control defined inside another data model. That binding is called a *source parameter*, and in the spec it looks like this:
 
 ```yaml
 - kind: control
@@ -61,7 +61,9 @@ The credentials' owner needs **Can edit** access to the workbook, and an account
 
 ## Usage
 
-Take the workbook id from its URL — either the UUID or the short url id works.
+Point it at a **workbook or a data model** — either the UUID or the short url id. The kind is detected automatically; `--type workbook|datamodel` skips the probe.
+
+Data models carry source parameters in the identical `parameters[]` shape (a model's control driving a control in its upstream model), so the same breakage and the same repair apply one level up the stack.
 
 ### Check
 
@@ -109,56 +111,50 @@ After writing, the tool re-reads the workbook and reports how many bindings stil
 
 ## Resolution rules
 
-A binding is healthy only when its data model is a live source **and** that model really defines the referenced control. Sigma validates both halves and matches control ids exactly, so a stale control id is just as broken as a stale model id.
-
-For anything else, the tool picks a target:
+Resolution is by **identity**: does a live data model define a control with this id?
 
 | Situation | Result |
 | --- | --- |
-| Live source, defines the control, and filters the right element | `ok` — left alone |
-| Exactly one live source defines a compatible control with that id | `REPAIR` — rewritten to that source |
+| Points at a live source that defines the control | `ok` — left alone |
+| Exactly one live source defines that control id | `REPAIR` — rewritten to that source |
 | Several live sources define that control id | `AMBIGUOUS` — needs `--data-model` |
 | No live source defines that control id | `NO MATCH` — needs `--map` |
-| The control exists but filters a different element | `MISMATCH` — needs `--map` |
 
-The last three are deliberate. If a control was renamed, removed, or points at the wrong element, the correct target is a judgement call about intent, and quietly rebinding it to something plausible would be worse than saying so.
-
-### Element mismatch
-
-A binding needs more than a control that exists. The data-model control must filter the **same element the workbook control reads its values from**. A control drawing its values from a Customers table cannot drive a control that filters Stores, and Sigma rejects the pairing with the same message it uses for a stale model id — which makes it easy to misread as a tool failure.
-
-`MISMATCH` catches that before the write and names the likely target:
-
-```
-[MISMATCH ] 'City'  (element aBcDeFgHiJcon)
-             data model control: Store-City
-             this control reads values from data model element customerElement1,
-             but 'Store-City' filters storeElement01 — Sigma rejects that pairing.
-             Did you mean 'Cust-City'? --map Store-City=Cust-City
-             reads element: customerElement1
-```
-
-Suggestions are the controls that actually filter the right element, ranked so one sharing the same trailing word comes first. That is a hint for you to confirm, never an automatic rebinding.
-
-If the control was instead meant to filter the *other* element, the fix is not a mapping — re-point its value source in Sigma, then run a plain repair.
+The last two are deliberate. If a control was renamed or removed, the correct target is a judgement call about intent, and quietly rebinding it to something plausible would be worse than saying so.
 
 Repairs are idempotent — running twice is a no-op.
 
+### What the tool will not predict
+
+Identity is not the same as acceptance. Sigma also decides whether a given control is a *valid target* for a given control, and that depends on filter reachability through the data model's join graph — which the code representation does not expose (a model's spec contains no relationships; they live in its upstream model).
+
+Measured behaviour, sweeping one control's value source against four candidate parameters:
+
+```
+value source                        Store-State  Store-City  Cust-State  Cust-City
+Store / Store State                 OK           OK          OK          OK
+Store / Store City                  OK           OK          OK          OK
+Customers / Cust State              REJECTED     REJECTED    OK          OK
+Customers / Cust City               REJECTED     REJECTED    OK          OK
+```
+
+It is asymmetric, so no rule derivable from the spec alone predicts it. **Sigma is therefore the oracle.** The tool resolves what it can prove, attempts the write, and translates a rejection into guidance:
+
+```
+Sigma refused the binding on control aBcDeFgHiJcon:
+  target: 22222222-... / Store-State
+  this control reads values from element customerElement1, while 'Store-State' filters storeElement01.
+  The control exists, so this is Sigma's write API declining the pairing rather than a missing id.
+  Controls filtering the element it reads: Cust-State, Cust-City, Cust-Region
+  To retarget: --map Store-State=Cust-State
+  If you believe this pairing is correct, set it in the Sigma UI — the write API will not accept it.
+```
+
+Note the last line. A refusal from the write API is not proof that your wiring is wrong; the UI may accept a pairing the spec API declines. The tool reports what happened rather than judging intent.
+
 ### Repair is all-or-nothing
 
-Sigma validates an entire spec on write, so a **partial repair cannot be saved**: one unresolved binding rejects the whole `PUT` and nothing changes. `repair --apply` therefore checks first and refuses to write while anything is unresolved, rather than attempting a doomed write:
-
-```
-Cannot write: 1 binding(s) could not be resolved.
-Sigma validates the whole spec on write, so a partial repair cannot be saved —
-an unresolved binding would reject the write and nothing would change.
-Resolve the remaining binding(s) with --map OLD_CONTROL_ID=NEW_CONTROL_ID
-(or --data-model to pick between sources), then run again.
-
-2 other binding(s) are ready and will be written in the same pass once the rest resolve.
-```
-
-Supply the missing mapping and every binding is repaired together in one atomic version.
+Sigma validates an entire spec on write, so a **partial repair cannot be saved**: one unresolved binding rejects the whole write and nothing changes. `repair --apply` checks first and refuses while anything is unresolved, suggesting only the flags that fit what is actually unresolved.
 
 ## Resolving what the tool cannot infer
 
@@ -232,8 +228,8 @@ So a spec that writes cleanly has no broken source parameters. Note that `GET` d
 ## Limitations
 
 - Only `kind: data-model` parameters are handled. Other parameter kinds are ignored.
-- A source parameter can only bind to a data-model control whose target element the workbook itself includes. Sigma rejects a binding to a control that filters an element the workbook does not use.
-- Workbook spec endpoints are a Sigma **beta** API and may change.
+- Whether Sigma accepts a target is only settled by attempting a write; `check` verifies identity, not acceptance.
+- Spec endpoints are a Sigma **beta** API and may change.
 - The tool verifies the repair at the API layer. It cannot click your dashboard for you — open the workbook to confirm the controls behave as you expect.
 
 ## Further reading

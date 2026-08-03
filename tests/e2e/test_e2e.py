@@ -8,15 +8,15 @@ logic or the API client.
 It builds its own fixtures, exercises the CLI against them, and removes
 everything it made:
 
-  1. clone a data model you point it at, renaming one control
-  2. build a workbook bound to the original model's controls
-  3. `swapSources` the workbook onto the clone — reproducing the real breakage
-  4. assert `check` reports the mixed outcome: repairable + one NO MATCH
-  5. assert `repair --apply` refuses to write while anything is unresolved
-  6. assert one `--map` unblocks every binding atomically, and is idempotent
-  7. assert the result validates server-side
-  8. assert a control retargeted at a different element reports MISMATCH,
-     suggests the compatible control, and repairs via that suggestion
+  1-2. clone a data model (renaming one control), build a workbook against the
+       original, and `swapSources` onto the clone — the real breakage
+  3.   assert `check` reports repairable bindings plus one NO MATCH
+  4.   assert `repair --apply` refuses to write while anything is unresolved
+  5.   assert one `--map` unblocks every binding atomically, and is idempotent
+  6.   assert the result validates server-side
+  7.   assert a rejection from Sigma is translated into guidance rather than
+       predicted up front
+  8.   assert data models are handled too — they carry the same `parameters[]`
 
 Usage:
     export SIGMA_BASE_URL=... SIGMA_CLIENT_ID=... SIGMA_CLIENT_SECRET=...
@@ -40,11 +40,15 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, REPO)
 
 from sigma_source_params import (  # noqa: E402
+    DATA_MODEL,
+    WORKBOOK,
     SigmaClient,
     SigmaError,
     data_model_control_ids,
     iter_elements,
 )
+
+WORKBOOK_KIND, DATA_MODEL_KIND = WORKBOOK, DATA_MODEL
 
 CLI = os.path.join(REPO, "sigma_source_params.py")
 PREFIX = "zz-e2e-source-params"
@@ -80,6 +84,15 @@ def run_cli(*args: str) -> tuple[int, dict]:
             f"CLI did not emit JSON for {' '.join(args)}: {proc.stdout!r} "
             f"stderr={proc.stderr!r}"
         ) from exc
+
+
+def run_cli_text(*args: str) -> tuple[int, str]:
+    """Run the CLI without --json and return (exit code, stdout+stderr)."""
+    proc = subprocess.run(
+        [sys.executable, CLI, *args],
+        capture_output=True, text=True, env=os.environ.copy(),
+    )
+    return proc.returncode, proc.stdout + proc.stderr
 
 
 def statuses(payload: dict) -> dict[str, str]:
@@ -299,8 +312,10 @@ def _find_inode(client: SigmaClient, name: str, collection: str) -> str:
     raise AssertionError(f"could not locate the {collection} entry named {name!r}")
 
 
-def swap_workbook_source(client: SigmaClient, wb_id: str, from_dm: str,
-                         to_dm: str, element_ids: list[str]) -> None:
+def swap_source(client: SigmaClient, kind: str, document_id: str, from_dm: str,
+                to_dm: str, element_ids: list[str]) -> None:
+    """Re-point a workbook OR a data model at a different data model."""
+    base = "workbooks" if kind == WORKBOOK else "dataModels"
     mapping = [
         {
             "from": {"type": "data-model", "dataModelId": from_dm,
@@ -311,9 +326,83 @@ def swap_workbook_source(client: SigmaClient, wb_id: str, from_dm: str,
         for element_id in element_ids
     ]
     client._call(
-        "POST", f"/v3alpha/workbooks/{wb_id}:swapSources",
+        "POST", f"/v3alpha/{base}/{document_id}:swapSources",
         {"sourceMapping": mapping},
     )
+
+
+def build_child_data_model(client: SigmaClient, parent_dm: str, parent_element: str,
+                           parent_control: str, folder_id: str,
+                           parent_spec: dict) -> str:
+    """A data model whose control drives a control in its PARENT data model.
+
+    This is the data-model equivalent of the workbook case: the same
+    `parameters[]` binding, one level up the stack.
+    """
+    dm_element = next(
+        e for page in parent_spec["pages"]
+        for e in iter_elements(page["elements"])
+        if e.get("id") == parent_element
+    )
+    formula_to_column, columns = {}, []
+    for index, column in enumerate(dm_element.get("columns") or []):
+        column_id = f"e2eDmCol{index:02d}"
+        columns.append({"id": column_id, "formula": column["formula"]})
+        formula_to_column[column["formula"]] = column_id
+    parent_formula = {
+        c["id"]: c["formula"] for c in (dm_element.get("columns") or [])
+    }
+    _, parent_column = dm_control_details(parent_spec).get(
+        parent_control, (None, None)
+    )
+    own_column = formula_to_column.get(parent_formula.get(parent_column))
+
+    table_id = "e2eDmTable01"
+    control: dict = {
+        "kind": "control",
+        "id": "e2eDmCtl00con",
+        "controlId": "E2EChildControl",
+        "controlType": "list",
+        "mode": "include",
+        "selectionMode": "multiple",
+        "values": [],
+        "parameters": [
+            {"kind": "data-model", "dataModelId": parent_dm,
+             "controlId": parent_control}
+        ],
+    }
+    if own_column:
+        control["source"] = {
+            "kind": "source",
+            "source": {"kind": "table", "elementId": table_id},
+            "columnId": own_column,
+        }
+        control["filters"] = [
+            {"source": {"kind": "table", "elementId": table_id},
+             "columnId": own_column}
+        ]
+    body = {
+        "name": f"{PREFIX}-child-dm-{int(time.time())}",
+        "folderId": folder_id,
+        "schemaVersion": 1,
+        "pages": [{"id": "e2eDmPage01", "name": "Page 1", "elements": [
+            {
+                "id": table_id,
+                "kind": "table",
+                "source": {"kind": "data-model", "dataModelId": parent_dm,
+                           "elementId": parent_element},
+                "columns": columns,
+                "order": [c["id"] for c in columns],
+            },
+            control,
+        ]}],
+    }
+    created = client._call("POST", "/v2/dataModels/spec", body)
+    dm_id = created_id(created, "dataModelId") or _find_inode(
+        client, body["name"], "dataModels"
+    )
+    _created.append(("data model", dm_id))
+    return dm_id
 
 
 def cleanup(client: SigmaClient) -> None:
@@ -362,7 +451,7 @@ def main() -> int:
         return 2
 
     client = SigmaClient.from_env()
-    source_spec = client.get_data_model_spec(source_dm)
+    source_spec = client.get_spec(DATA_MODEL, source_dm)
     folder_id = os.environ.get("SIGMA_E2E_FOLDER_ID") or source_spec["folderId"]
 
     all_controls = data_model_control_ids(source_spec)
@@ -413,7 +502,8 @@ def main() -> int:
         )
 
         print("\n2. swapSources reproduces the breakage")
-        swap_workbook_source(client, wb_id, source_dm, clone_dm, [table_element])
+        swap_source(client, WORKBOOK_KIND, wb_id, source_dm, clone_dm,
+                    [table_element])
         code, payload = run_cli("check", wb_id)
         found = statuses(payload)
         check("check exits 1", code == 1, f"exit={code}")
@@ -494,7 +584,7 @@ def main() -> int:
         # POST rejects any spec containing an invalid source parameter, so a
         # successful round-trip is Sigma's own confirmation that the bindings
         # are sound. Nothing is created when it rejects.
-        spec = client.get_workbook_spec(wb_id)
+        spec = client.get_spec(WORKBOOK, wb_id)
         probe = {
             "name": f"{PREFIX}-validation-probe-{int(time.time())}",
             "folderId": folder_id,
@@ -508,7 +598,12 @@ def main() -> int:
         except SigmaError as exc:
             check("Sigma accepts the repaired spec", False, str(exc))
 
-        print("\n7. a control filtering the wrong element is a MISMATCH")
+        print("\n7. a rejection from Sigma is translated, not predicted")
+        # The tool no longer guesses whether Sigma will accept a target: validity
+        # depends on filter reachability through the model's join graph, which the
+        # code representation does not expose. So drive a real rejection and check
+        # the tool explains it. The mis-wiring cannot be authored directly (Sigma
+        # refuses it), so it is reached via a retargeted clone plus a source swap.
         others = [el for el in grouped if el != table_element and grouped[el]]
         if not others:
             print("  SKIP  the source data model has controls on only one "
@@ -523,44 +618,77 @@ def main() -> int:
             wb2 = build_workbook(
                 client, source_dm, table_element, [victim2], folder_id, source_spec
             )
-            # Valid until the swap moves the control's target out from under it.
             code, payload = run_cli("check", wb2)
-            check("the mis-wiring is not detectable before the swap", code == 0,
+            check("healthy before the swap", code == 0,
                   json.dumps(statuses(payload)))
 
-            swap_workbook_source(client, wb2, source_dm, retargeted, [table_element])
+            swap_source(client, WORKBOOK_KIND, wb2, source_dm, retargeted,
+                        [table_element])
+
+            # Identity-wise this resolves fine, so the tool will attempt the write.
             code, payload = run_cli("check", wb2)
-            found2 = statuses(payload)
-            check("check exits 1", code == 1, f"exit={code}")
-            check("reported as element-mismatch, not repairable",
-                  found2.get(victim2) == "element-mismatch", json.dumps(found2))
+            check("the tool considers it resolvable",
+                  statuses(payload).get(victim2) == "repairable",
+                  json.dumps(statuses(payload)))
 
-            finding = payload["findings"][0]
-            check("it names the element the control actually reads",
-                  finding["readsDataModelElement"] is not None,
-                  json.dumps(finding))
-            check("it suggests a control filtering the right element",
-                  bool(finding["suggestedControlIds"]),
-                  json.dumps(finding["suggestedControlIds"]))
-            check("every suggestion really filters that element",
-                  all(s in grouped[table_element]
-                      for s in finding["suggestedControlIds"]),
-                  f"suggested={finding['suggestedControlIds']} "
-                  f"valid={grouped[table_element]}")
+            code, text = run_cli_text("repair", wb2, "--apply")
+            check("repair exits non-zero when Sigma refuses", code == 1,
+                  f"exit={code}")
+            check("it says the write was refused and nothing changed",
+                  "refused" in text and "nothing changed" in text, text[:300])
+            check("it names the offending element",
+                  "e2eCtl00con" in text, text[:300])
+            check("it explains this is the write API declining, not a bad id",
+                  "write API" in text, text[:300])
+            check("it offers the controls that filter the element it reads",
+                  "--map" in text, text[:300])
+            check("it points at the UI as the alternative",
+                  "Sigma UI" in text, text[:300])
 
-            code, payload = run_cli("repair", wb2, "--apply")
-            check("repair refuses to write a mismatch", code == 1, f"exit={code}")
-            check("nothing was written", payload.get("applied") is False,
-                  f"applied={payload.get('applied')}")
+            after_code, after = run_cli("check", wb2)
+            check("the document is untouched on the server",
+                  after["findings"][0]["currentDataModelId"] == source_dm,
+                  json.dumps(after["findings"][0]))
 
-            suggestion = finding["suggestedControlIds"][0]
-            code, payload = run_cli(
-                "repair", wb2, "--map", f"{victim2}={suggestion}", "--apply"
-            )
-            check("the suggested mapping repairs it", code == 0, f"exit={code}")
-            check("nothing needs attention any more",
-                  payload["stillNeedingAttention"] == 0,
-                  f"remaining={payload['stillNeedingAttention']}")
+        print("\n8. data models carry source parameters too")
+        # A data model's controls take the identical parameters[] shape, so the
+        # same breakage and the same repair apply one level up the stack.
+        mid_clone = build_renamed_clone(
+            client, source_spec, "\x00none\x00", "\x00none\x00", folder_id
+        )
+        child = build_child_data_model(
+            client, source_dm, table_element, used[0], folder_id, source_spec
+        )
+        code, payload = run_cli("check", child)
+        check("a data model id is accepted, not an opaque API error", code == 0,
+              json.dumps(payload)[:300])
+        check("detected as a data model",
+              payload.get("documentKind") == "data model",
+              str(payload.get("documentKind")))
+        check("its source parameter is healthy to begin with",
+              set(statuses(payload).values()) == {"healthy"},
+              json.dumps(statuses(payload)))
+
+        swap_source(client, DATA_MODEL_KIND, child, source_dm, mid_clone,
+                    [table_element])
+        code, payload = run_cli("check", child)
+        check("check exits 1 after the swap", code == 1, f"exit={code}")
+        check("the stale binding is repairable",
+              set(statuses(payload).values()) == {"repairable"},
+              json.dumps(statuses(payload)))
+
+        code, payload = run_cli("repair", child, "--apply")
+        check("repair exits 0", code == 0, f"exit={code}")
+        check("it repaired the binding", payload["repaired"] == 1,
+              f"repaired={payload['repaired']}")
+        check("nothing needs attention any more",
+              payload["stillNeedingAttention"] == 0,
+              f"remaining={payload['stillNeedingAttention']}")
+
+        code, payload = run_cli("repair", child, "--apply")
+        check("a second data model repair changes nothing",
+              code == 0 and not payload.get("applied"),
+              f"exit={code} applied={payload.get('applied')}")
 
     finally:
         cleanup(client)

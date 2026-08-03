@@ -111,48 +111,61 @@ unresolved, instead of attempting a write that cannot succeed.
 This is why the escape hatches matter: `--map` and `--data-model` are not
 conveniences, they are what unblocks the write.
 
-## The two halves of a binding must agree on an element
+## Identity is not acceptance
 
-A source parameter is only valid when the data-model control it targets filters
-the *same* data-model element that the workbook control reads its values from.
-Merely having that element somewhere in the workbook is not enough.
+A binding names a `(dataModelId, controlId)` pair. Both must resolve — but even
+when they do, Sigma may still decline the pairing.
 
-Concretely, given a workbook control:
-
-```yaml
-- kind: control
-  id: aBcDeFgHiJcon
-  source:                                   # where it reads its values
-    kind: source
-    source: { kind: table, elementId: wbCustomerTable }
-    columnId: TuVwXyZ013
-  parameters:
-    - kind: data-model
-      dataModelId: 22222222-2222-2222-2222-222222222222
-      controlId: Store-City                 # filters the Store element
-```
-
-If `wbCustomerTable` reads the model's `Customer` element while `Store-City`
-filters its `Store` element, the binding is rejected — even though the workbook
-may also contain a table reading `Store`:
+Sweeping one control's value source against four candidate parameters, holding
+everything else constant:
 
 ```
-Invalid parameter on control: aBcDeFgHiJcon targeting data model: 22222222-2222-2222-2222-222222222222, controlId: Customer-City.
+value source                        Store-State  Store-City  Cust-State  Cust-City
+Store / Store State                 OK           OK          OK          OK
+Store / Store City                  OK           OK          OK          OK
+Customers / Cust State              REJECTED     REJECTED    OK          OK
+Customers / Cust City               REJECTED     REJECTED    OK          OK
 ```
 
-Note that a control's `source` and its `filters` routinely name *different*
-elements: `filters` is what the control filters inside the workbook, `source` is
-where its value list comes from. **Only `source` matters here.** Reading
-`filters` instead will point at the wrong element and produce false diagnoses.
+The column within the element makes no difference; the element does, and
+**asymmetrically** — a Store-sourced control may drive any of the four, while a
+Customers-sourced control may drive only the `Cust-*` pair. An earlier version of
+this document claimed the two elements must simply match. That is false, and the
+table above is the disproof.
 
-This is indistinguishable by message from the stale-model case, which makes it
-easy to misread: the model id in the error may be entirely correct and the
-control may genuinely exist. `plan_repairs` therefore compares the two elements
-itself and reports `element-mismatch`, naming the element the control reads and
-suggesting the controls that filter it — ranked so a control sharing the same
-trailing word (`Store-City` → `Cust-City`) comes first. That ranking only
-orders and phrases a suggestion; nothing is ever rebound automatically on the
-strength of a name.
+The asymmetry looks like filter reachability through the model's join graph, and
+that is not derivable from the spec: a data model's code representation contains
+no relationships at all — they live in its upstream model. So the tool does not
+try. It resolves identity, attempts the write, and translates a rejection.
+
+`PUT` and `POST` were checked against each other and agree, so either can be
+used as an oracle; `POST` has the useful property of creating nothing when it
+rejects, which makes it a non-destructive preflight.
+
+## A rejection is not a verdict on intent
+
+`Invalid parameter on control: X targeting data model: Y, controlId: Z` is
+emitted for at least three different causes — a stale model id, a control that
+does not exist, and a pairing the API declines. `explain_rejection()`
+distinguishes them by re-reading the target model, and is careful to say that the
+*write API* refused rather than that the user is wrong: the UI may well accept a
+pairing the spec API will not.
+
+## Data models carry source parameters too
+
+`parameters[]` on a control is documented in the data-model spec schema with the
+identical shape, so a model's control can drive a control in its upstream model —
+and a source swap breaks it the same way. Endpoint differences:
+
+| | Workbook | Data model |
+| --- | --- | --- |
+| spec | `/v2/workbooks/{id}/spec` | `/v2/dataModels/{id}/spec` |
+| `PUT` body | `schemaVersion`, `pages`, `layout`, theme | `schemaVersion`, `pages` **only** |
+| sources | bare JSON array | `{"entries": [...]}` |
+
+Sending `layout` to a data model is rejected, and reading `sources` as a bare
+list silently yields no live sources for a model — which would make every
+binding look unresolvable.
 
 ## Nested elements
 
