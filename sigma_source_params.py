@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
-"""Detect and repair broken Sigma workbook source parameters.
+"""Detect and repair broken Sigma source parameters.
 
-A Sigma workbook control can bind to a control defined inside a data model — a
-"source parameter". In the workbook spec that binding looks like this:
+A control — in a **workbook or a data model** — can bind to a control defined
+inside another data model. That binding is a "source parameter", and in the spec
+it looks like this:
 
     - kind: control
-      controlId: RegionControl          # the workbook-side control
+      controlId: RegionControl          # this document's control
       id: aBcDeFgHiJcon
       parameters:                       # <-- source parameters
         - kind: data-model
           dataModelId: 11111111-1111-1111-1111-111111111111
-          controlId: Store-Region       # the control inside the data model
+          controlId: Store-Region       # the control inside that data model
 
-`swapSources` remaps columns and metrics, but it does not remap parameters. After
-you re-point a workbook at a different data model, every `parameters[].dataModelId`
-still names the *old* model and every source parameter goes invalid.
+`swapSources` remaps columns and metrics, but not parameters. After you re-point
+a document at a different data model, every `parameters[].dataModelId` still
+names the *old* model and every source parameter goes invalid.
 
 This tool finds those stale bindings and rewrites them to the data model the
-workbook actually reads from now.
+document actually reads from now.
 
-Sigma validates both halves of a binding and matches control ids *exactly*, so a
-binding can only be repaired to a control that genuinely exists. Where the tool
-cannot determine the right target on its own — a control renamed between template
-and clone, a control that filters a different element than the workbook control
-reads from, or several live models defining the same control id — supply the
-missing knowledge with `--map` and `--data-model` rather than letting it guess.
+What it will not do is predict whether Sigma considers a given control a valid
+target. Validity depends on filter reachability through the model's join graph,
+which the code representation does not expose — so Sigma is the oracle. The tool
+resolves what it can prove, asks Sigma to accept the result, and translates a
+rejection into something actionable.
 
 Stdlib only — no dependencies.
 """
@@ -42,13 +42,16 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
-__version__ = "1.2.0"
+__version__ = "2.0.0"
 
 # Exit codes, chosen so `check` works as a CI gate.
 EXIT_OK = 0
-EXIT_FINDINGS = 1  # stale bindings found (check), or some were unresolvable
+EXIT_FINDINGS = 1  # stale bindings found, or the write was refused
 EXIT_CONFIG = 2  # missing credentials or bad arguments
 EXIT_API = 3  # the Sigma API returned an error
+
+WORKBOOK = "workbook"
+DATA_MODEL = "data model"
 
 
 # --------------------------------------------------------------------------
@@ -81,7 +84,7 @@ class SourceParameter:
 
     element_id: str
     element_name: str
-    workbook_control_id: str
+    own_control_id: str
     data_model_id: str
     dm_control_id: str
     raw: dict = field(repr=False, compare=False)
@@ -89,30 +92,28 @@ class SourceParameter:
     source_dm_element_id: str | None = None
     """The data-model element this control reads its values from, if known.
 
-    Sigma requires a source parameter to target a data-model control that
-    filters this same element, so it is what makes a binding *compatible* rather
-    than merely well-formed.
+    Not used to judge validity — only to suggest candidates once Sigma has
+    rejected a binding.
     """
 
 
-def workbook_element_sources(spec: dict) -> dict[str, str]:
-    """Workbook element id -> the data-model element it reads."""
+def element_source_map(spec: dict) -> dict[str, str]:
+    """Element id -> the data-model element it reads. Works for either doc type."""
     sources = {}
     for page in spec.get("pages") or []:
         for element in iter_elements(page.get("elements")):
             source = element.get("source") or {}
-            if source.get("kind") == "data-model" and element.get("id"):
-                if source.get("elementId"):
-                    sources[element["id"]] = source["elementId"]
+            if (source.get("kind") == "data-model" and element.get("id")
+                    and source.get("elementId")):
+                sources[element["id"]] = source["elementId"]
     return sources
 
 
 def _control_value_source(control: dict) -> str | None:
-    """The workbook element a control reads its values from.
+    """The element a control reads its values from.
 
-    Only `source` counts. A control's `filters` may well target a different
-    element — that is the element it *filters*, not the one it draws values from
-    — and it is the value source that Sigma validates the parameter against.
+    Only `source` counts. A control's `filters` may name a different element —
+    that is what it filters, not where its values come from.
     """
     source = control.get("source") or {}
     inner = source.get("source") or {}
@@ -120,8 +121,8 @@ def _control_value_source(control: dict) -> str | None:
 
 
 def find_source_parameters(spec: dict) -> list[SourceParameter]:
-    """Collect every data-model source parameter in a workbook spec."""
-    element_sources = workbook_element_sources(spec)
+    """Collect every data-model source parameter in a workbook or model spec."""
+    sources = element_source_map(spec)
     found: list[SourceParameter] = []
     for page in spec.get("pages") or []:
         for element in iter_elements(page.get("elements")):
@@ -136,11 +137,11 @@ def find_source_parameters(spec: dict) -> list[SourceParameter]:
                     SourceParameter(
                         element_id=element.get("id", ""),
                         element_name=name,
-                        workbook_control_id=element.get("controlId", ""),
+                        own_control_id=element.get("controlId", ""),
                         data_model_id=param.get("dataModelId", ""),
                         dm_control_id=param.get("controlId", ""),
                         raw=param,
-                        source_dm_element_id=element_sources.get(value_source),
+                        source_dm_element_id=sources.get(value_source),
                     )
                 )
     return found
@@ -173,7 +174,6 @@ HEALTHY = "healthy"
 REPAIRABLE = "repairable"
 AMBIGUOUS = "ambiguous"
 MISSING_CONTROL = "missing-control"
-MISMATCH = "element-mismatch"
 
 
 @dataclass
@@ -184,7 +184,6 @@ class Finding:
     new_control_id: str | None = None
     reason: str = ""
     available_control_ids: tuple[str, ...] = ()
-    suggested_control_ids: tuple[str, ...] = ()
 
     @property
     def needs_attention(self) -> bool:
@@ -196,24 +195,19 @@ class Finding:
             "status": self.status,
             "elementId": p.element_id,
             "elementName": p.element_name,
-            "workbookControlId": p.workbook_control_id,
+            "ownControlId": p.own_control_id,
             "dataModelControlId": p.dm_control_id,
             "currentDataModelId": p.data_model_id,
             "newDataModelId": self.new_data_model_id,
             "newDataModelControlId": self.new_control_id,
             "reason": self.reason,
             "availableControlIds": list(self.available_control_ids),
-            "suggestedControlIds": list(self.suggested_control_ids),
             "readsDataModelElement": p.source_dm_element_id,
         }
 
 
 def parse_control_map(pairs: Iterable[str]) -> dict[str, str]:
-    """Parse ``OLD=NEW`` control-id rename pairs.
-
-    Raises ``ValueError`` on a malformed pair so the CLI can complain clearly
-    rather than silently ignoring a typo.
-    """
+    """Parse ``OLD=NEW`` control-id rename pairs."""
     mapping: dict[str, str] = {}
     for pair in pairs:
         if "=" not in pair:
@@ -223,9 +217,7 @@ def parse_control_map(pairs: Iterable[str]) -> dict[str, str]:
         old, new = pair.split("=", 1)
         old, new = old.strip(), new.strip()
         if not old or not new:
-            raise ValueError(
-                f"invalid mapping {pair!r} — both sides must be non-empty"
-            )
+            raise ValueError(f"invalid mapping {pair!r} — both sides must be non-empty")
         mapping[old] = new
     return mapping
 
@@ -251,71 +243,10 @@ def load_control_map_file(text: str) -> dict[str, str]:
     return parse_control_map(lines)
 
 
-def _name_stem(control_id: str) -> str:
-    """The trailing word of a control id, for ranking suggestions by likeness.
-
-    `Store-City` and `Cust-City` share the stem "city". Used only to order and
-    phrase suggestions — never to rebind anything automatically.
-    """
-    parts = [p for p in re.split(r"[^0-9A-Za-z]+", control_id) if p]
-    return parts[-1].lower() if parts else control_id.lower()
-
-
-def _rank_suggestions(target_control: str, suggestions: Iterable[str]) -> tuple:
-    """Order suggestions so same-stem candidates come first."""
-    stem = _name_stem(target_control)
-    return tuple(sorted(suggestions, key=lambda c: (_name_stem(c) != stem, c)))
-
-
-def _mismatch(
-    parameter: SourceParameter,
-    target_control: str,
-    target_element: str | None,
-    suggestions: tuple[str, ...],
-) -> Finding:
-    """A control that exists but filters the wrong element."""
-    ranked = _rank_suggestions(target_control, suggestions)
-    stem = _name_stem(target_control)
-    likely = [c for c in ranked if _name_stem(c) == stem]
-
-    reason = (
-        f"this control reads values from data model element "
-        f"{parameter.source_dm_element_id}, but {target_control!r} filters "
-        f"{target_element} — Sigma rejects that pairing"
-    )
-    if len(likely) == 1:
-        reason += (
-            f". Did you mean {likely[0]!r}? "
-            f"--map {parameter.dm_control_id}={likely[0]}"
-        )
-    elif len(ranked) == 1:
-        reason += (
-            f". Did you mean {ranked[0]!r}? "
-            f"--map {parameter.dm_control_id}={ranked[0]}"
-        )
-    elif ranked:
-        reason += (
-            f". Controls filtering the right element: {', '.join(ranked)} — "
-            f"pick one with --map {parameter.dm_control_id}=..."
-        )
-    else:
-        reason += (
-            ". No control filters that element, so either re-point this "
-            "control's value source or add a matching control to the data model"
-        )
-    return Finding(
-        parameter, MISMATCH, reason=reason, suggested_control_ids=ranked
-    )
-
-
 def _normalize_controls(
     controls_by_data_model: dict[str, Any],
 ) -> dict[str, dict[str, str | None]]:
-    """Accept either a set of control ids or a control-id -> target-element map.
-
-    A bare set carries no target information, so compatibility checking is
-    skipped for that data model rather than guessed at.
-    """
+    """Accept either a set of control ids or a control-id -> target-element map."""
     normalized: dict[str, dict[str, str | None]] = {}
     for data_model_id, controls in (controls_by_data_model or {}).items():
         if isinstance(controls, dict):
@@ -323,19 +254,6 @@ def _normalize_controls(
         else:
             normalized[data_model_id] = {control: None for control in controls}
     return normalized
-
-
-def _compatible(
-    parameter: SourceParameter, target: str | None
-) -> bool | None:
-    """Whether a data-model control can serve this workbook control.
-
-    Returns None when either side's element is unknown, meaning "cannot tell" —
-    the caller must not treat that as a failure.
-    """
-    if parameter.source_dm_element_id is None or target is None:
-        return None
-    return parameter.source_dm_element_id == target
 
 
 def plan_repairs(
@@ -347,15 +265,9 @@ def plan_repairs(
 ) -> list[Finding]:
     """Classify each source parameter and choose a repair target.
 
-    A binding is healthy only when its data model is a live source *and* that
-    model really defines the referenced control — Sigma validates both halves and
-    matches control ids exactly, so a stale control id is just as broken as a
-    stale model id.
-
-    ``control_renames`` maps an old data-model control id to its new name, for
-    controls deliberately renamed between template and clone.
-    ``preferred_data_model_id`` breaks ties when several live models define the
-    same control id.
+    Resolution is by identity only: does a live data model define a control of
+    this id? Whether Sigma will *accept* that control as a target is not decided
+    here — see the module docstring.
     """
     renames = control_renames or {}
     controls = _normalize_controls(controls_by_data_model)
@@ -364,41 +276,16 @@ def plan_repairs(
         sorted({c for dm in live_data_model_ids for c in controls.get(dm, {})})
     )
 
-    def suggestions_for(param: SourceParameter, data_model_ids: list[str]) -> tuple:
-        """Control ids in these models that filter the element the control reads."""
-        if param.source_dm_element_id is None:
-            return ()
-        return tuple(sorted({
-            control
-            for data_model_id in data_model_ids
-            for control, target in controls.get(data_model_id, {}).items()
-            if target == param.source_dm_element_id
-        }))
-
     for param in parameters:
         target_control = renames.get(param.dm_control_id, param.dm_control_id)
         was_renamed = target_control != param.dm_control_id
         current_is_live = param.data_model_id in live_data_model_ids
-        current_controls = controls.get(param.data_model_id, {})
-        current_defines_target = target_control in current_controls
+        current_defines_target = target_control in controls.get(param.data_model_id, {})
 
-        # The model is right and defines the control, but the control filters a
-        # different element than this control reads from — Sigma rejects that.
-        if current_is_live and current_defines_target:
-            fit = _compatible(param, current_controls.get(target_control))
-            if fit is False:
-                findings.append(_mismatch(
-                    param, target_control, current_controls.get(target_control),
-                    suggestions_for(param, [param.data_model_id]),
-                ))
-                continue
-
-        # Already correct, and no rename asked for.
         if current_is_live and current_defines_target and not was_renamed:
             findings.append(Finding(param, HEALTHY, reason="points at a live source"))
             continue
 
-        # Right model, wrong control name — rewrite the control id in place.
         if current_is_live and current_defines_target and was_renamed:
             findings.append(
                 Finding(
@@ -411,20 +298,9 @@ def plan_repairs(
             )
             continue
 
-        defining = [dm for dm in live_data_model_ids if target_control in controls.get(dm, {})]
-        # Only models where the control is also compatible can actually be used.
         candidates = [
-            dm for dm in defining
-            if _compatible(param, controls.get(dm, {}).get(target_control)) is not False
+            dm for dm in live_data_model_ids if target_control in controls.get(dm, {})
         ]
-
-        if defining and not candidates:
-            findings.append(_mismatch(
-                param, target_control,
-                controls.get(defining[0], {}).get(target_control),
-                suggestions_for(param, defining),
-            ))
-            continue
 
         if preferred_data_model_id and preferred_data_model_id in candidates:
             findings.append(
@@ -437,16 +313,14 @@ def plan_repairs(
                 )
             )
         elif len(candidates) == 1:
-            rename_note = (
-                f" (renamed from {param.dm_control_id!r})" if was_renamed else ""
-            )
+            note = f" (renamed from {param.dm_control_id!r})" if was_renamed else ""
             findings.append(
                 Finding(
                     param,
                     REPAIRABLE,
                     candidates[0],
                     target_control if was_renamed else None,
-                    f"live source defines control {target_control!r}{rename_note}",
+                    f"live source defines control {target_control!r}{note}",
                 )
             )
         elif len(candidates) > 1:
@@ -464,11 +338,8 @@ def plan_repairs(
             )
         elif not live_data_model_ids:
             findings.append(
-                Finding(
-                    param,
-                    MISSING_CONTROL,
-                    reason="the workbook has no live data-model sources",
-                )
+                Finding(param, MISSING_CONTROL,
+                        reason="this document has no live data-model sources")
             )
         else:
             findings.append(
@@ -487,14 +358,13 @@ def plan_repairs(
 
 
 def blocking_findings(findings: list[Finding]) -> list[Finding]:
-    """Findings that make the workbook unwritable.
+    """Findings that make the document unwritable.
 
     Sigma validates an entire spec on write and rejects any invalid source
     parameter, so a *partial* repair cannot be persisted: one unresolved binding
-    fails the whole PUT and nothing changes. Every binding therefore has to be
-    resolvable before writing is attempted.
+    fails the whole write and nothing changes.
     """
-    return [f for f in findings if f.status in (AMBIGUOUS, MISSING_CONTROL, MISMATCH)]
+    return [f for f in findings if f.status in (AMBIGUOUS, MISSING_CONTROL)]
 
 
 def apply_repairs(findings: list[Finding]) -> int:
@@ -511,13 +381,110 @@ def apply_repairs(findings: list[Finding]) -> int:
     return changed
 
 
-def spec_to_update_body(spec: dict) -> dict:
-    """Reduce a GET spec to the body PUT accepts, dropping read-only metadata."""
+def spec_to_update_body(spec: dict, kind: str = WORKBOOK) -> dict:
+    """Reduce a GET spec to the body PUT accepts, dropping read-only metadata.
+
+    A data model's spec endpoint takes only `schemaVersion` and `pages`; layout
+    and theme are workbook-only and are rejected if sent.
+    """
     body = {"schemaVersion": spec["schemaVersion"], "pages": spec["pages"]}
-    for optional in ("layout", "themeName", "themeOverrides"):
-        if optional in spec:
-            body[optional] = spec[optional]
+    if kind == WORKBOOK:
+        for optional in ("layout", "themeName", "themeOverrides"):
+            if optional in spec:
+                body[optional] = spec[optional]
     return body
+
+
+# --------------------------------------------------------------------------
+# Translating Sigma's rejection into something actionable
+# --------------------------------------------------------------------------
+
+INVALID_PARAMETER_RE = re.compile(
+    r"Invalid parameter on control:\s*(?P<element>[^\s]+)\s+"
+    r"targeting data model:\s*(?P<data_model>[^,]+),\s*"
+    r"controlId:\s*(?P<control>.+?)\.?$",
+    re.MULTILINE,
+)
+
+
+def parse_invalid_parameter(message: str) -> dict | None:
+    """Pull the element, data model and control out of Sigma's rejection."""
+    match = INVALID_PARAMETER_RE.search(message or "")
+    if not match:
+        return None
+    return {
+        "elementId": match.group("element").strip(),
+        "dataModelId": match.group("data_model").strip(),
+        "controlId": match.group("control").strip(),
+    }
+
+
+def _name_stem(control_id: str) -> str:
+    """The trailing word of a control id, for ordering candidates by likeness."""
+    parts = [p for p in re.split(r"[^0-9A-Za-z]+", control_id) if p]
+    return parts[-1].lower() if parts else control_id.lower()
+
+
+def candidates_for(
+    parameter: SourceParameter | None,
+    controls: dict[str, str | None],
+    like: str,
+) -> tuple[str, ...]:
+    """Controls filtering the element this control reads, likest name first."""
+    if parameter is None or parameter.source_dm_element_id is None:
+        return ()
+    matches = [
+        control
+        for control, target in controls.items()
+        if target == parameter.source_dm_element_id
+    ]
+    stem = _name_stem(like)
+    return tuple(sorted(matches, key=lambda c: (_name_stem(c) != stem, c)))
+
+
+def explain_rejection(
+    message: str,
+    parameters: list[SourceParameter],
+    controls_by_data_model: dict[str, Any],
+) -> str:
+    """Turn Sigma's 400 into guidance, without asserting the user is wrong."""
+    parsed = parse_invalid_parameter(message)
+    if not parsed:
+        return message
+    controls = _normalize_controls(controls_by_data_model)
+    param = next(
+        (p for p in parameters if p.element_id == parsed["elementId"]), None
+    )
+    target_control = parsed["controlId"]
+    dm_controls = controls.get(parsed["dataModelId"], {})
+
+    lines = [
+        f"Sigma refused the binding on control {parsed['elementId']}:",
+        f"  target: {parsed['dataModelId']} / {target_control}",
+    ]
+    if target_control not in dm_controls:
+        lines.append(f"  that data model does not define a control named "
+                     f"{target_control!r}.")
+        if dm_controls:
+            lines.append(f"  it defines: {', '.join(sorted(dm_controls))}")
+        return "\n".join(lines)
+
+    reads = param.source_dm_element_id if param else None
+    filters = dm_controls.get(target_control)
+    if reads and filters and reads != filters:
+        lines.append(f"  this control reads values from element {reads}, while "
+                     f"{target_control!r} filters {filters}.")
+    lines.append("  The control exists, so this is Sigma's write API declining "
+                 "the pairing rather than a missing id.")
+
+    options = candidates_for(param, dm_controls, target_control)
+    if options:
+        lines.append("  Controls filtering the element it reads: "
+                     + ", ".join(options))
+        lines.append(f"  To retarget: --map {parsed['controlId']}={options[0]}")
+    lines.append("  If you believe this pairing is correct, set it in the Sigma "
+                 "UI — the write API will not accept it.")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -527,6 +494,10 @@ def spec_to_update_body(spec: dict) -> dict:
 
 class SigmaError(RuntimeError):
     pass
+
+
+class SigmaConfigError(SigmaError):
+    """Bad input or credentials, as opposed to an API failure."""
 
 
 class SigmaClient:
@@ -546,7 +517,7 @@ class SigmaClient:
             if not os.environ.get(name)
         ]
         if missing:
-            raise SigmaError(
+            raise SigmaConfigError(
                 "missing environment variable(s): "
                 + ", ".join(missing)
                 + "\nSee the README for how to obtain API credentials."
@@ -577,7 +548,7 @@ class SigmaClient:
                 with urllib.request.urlopen(request) as response:
                     self._token = json.load(response)["access_token"]
             except urllib.error.HTTPError as exc:
-                raise SigmaError(
+                raise SigmaConfigError(
                     f"token exchange failed (HTTP {exc.code}). Check "
                     f"SIGMA_BASE_URL matches your cloud and region, and that the "
                     f"client id/secret are correct."
@@ -586,7 +557,7 @@ class SigmaClient:
                 raise SigmaError("token endpoint returned an unexpected body") from exc
         return self._token
 
-    def _call(self, method: str, path: str, body: Any = None) -> Any:
+    def call(self, method: str, path: str, body: Any = None) -> Any:
         data = json.dumps(body).encode() if body is not None else None
         headers = {"Authorization": f"Bearer {self.token}"}
         if data:
@@ -599,6 +570,10 @@ class SigmaClient:
                 raw = response.read().decode()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode()[:1000]
+            try:
+                detail = json.loads(detail).get("message", detail)
+            except json.JSONDecodeError:
+                pass
             raise SigmaError(f"HTTP {exc.code} on {method} {path}\n{detail}") from exc
         except urllib.error.URLError as exc:
             raise SigmaError(f"could not reach {self.base_url}: {exc.reason}") from exc
@@ -607,19 +582,56 @@ class SigmaClient:
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            return raw  # some write endpoints answer in YAML
+            return raw  # the spec write endpoints answer in YAML
 
-    def get_workbook_spec(self, workbook_id: str) -> dict:
-        return self._call("GET", f"/v2/workbooks/{workbook_id}/spec?format=json")
+    _call = call  # kept for callers written against the old private name
 
-    def update_workbook_spec(self, workbook_id: str, body: dict) -> Any:
-        return self._call("PUT", f"/v2/workbooks/{workbook_id}/spec", body)
+    # -- document-kind aware helpers ---------------------------------------
 
-    def get_workbook_sources(self, workbook_id: str) -> list[dict]:
-        return self._call("GET", f"/v2/workbooks/{workbook_id}/sources")
+    def detect_kind(self, document_id: str) -> str:
+        """Is this id a workbook or a data model?"""
+        for path, kind in (("workbooks", WORKBOOK), ("dataModels", DATA_MODEL)):
+            try:
+                self.call("GET", f"/v2/{path}/{document_id}")
+                return kind
+            except SigmaError:
+                continue
+        raise SigmaConfigError(
+            f"{document_id!r} is neither a workbook nor a data model that these "
+            f"credentials can see. Check the id and that the account has access."
+        )
 
-    def get_data_model_spec(self, data_model_id: str) -> dict:
-        return self._call("GET", f"/v2/dataModels/{data_model_id}/spec?format=json")
+    def _base(self, kind: str) -> str:
+        return "workbooks" if kind == WORKBOOK else "dataModels"
+
+    def get_spec(self, kind: str, document_id: str) -> dict:
+        return self.call(
+            "GET", f"/v2/{self._base(kind)}/{document_id}/spec?format=json"
+        )
+
+    def update_spec(self, kind: str, document_id: str, body: dict) -> Any:
+        return self.call("PUT", f"/v2/{self._base(kind)}/{document_id}/spec", body)
+
+    def get_sources(self, kind: str, document_id: str) -> list[dict]:
+        """Normalize the two response shapes: a bare list, or {entries: [...]}."""
+        raw = self.call("GET", f"/v2/{self._base(kind)}/{document_id}/sources")
+        if isinstance(raw, dict):
+            raw = raw.get("entries") or []
+        return raw if isinstance(raw, list) else []
+
+    def resolve_data_model_id(self, given: str) -> str:
+        """Accept a url id as well as a UUID."""
+        try:
+            meta = self.call("GET", f"/v2/dataModels/{given}")
+        except SigmaError as exc:
+            raise SigmaConfigError(
+                f"--data-model {given!r} is not a data model these credentials "
+                f"can see."
+            ) from exc
+        resolved = meta.get("dataModelId")
+        if not resolved:
+            raise SigmaConfigError(f"--data-model {given!r} did not resolve to an id")
+        return resolved
 
 
 # --------------------------------------------------------------------------
@@ -631,43 +643,55 @@ _LABEL = {
     REPAIRABLE: "REPAIR   ",
     AMBIGUOUS: "AMBIGUOUS",
     MISSING_CONTROL: "NO MATCH ",
-    MISMATCH: "MISMATCH ",
 }
+
+
+@dataclass
+class Analysis:
+    kind: str
+    spec: dict
+    live: list[str]
+    findings: list[Finding]
+    parameters: list[SourceParameter]
+    controls: dict[str, dict[str, str | None]]
 
 
 def analyze(
     client: SigmaClient,
-    workbook_id: str,
+    kind: str,
+    document_id: str,
     control_renames: dict[str, str] | None = None,
     preferred_data_model_id: str | None = None,
-) -> tuple[dict, list[str], list[Finding]]:
-    spec = client.get_workbook_spec(workbook_id)
-    sources = client.get_workbook_sources(workbook_id)
+) -> Analysis:
+    spec = client.get_spec(kind, document_id)
+    sources = client.get_sources(kind, document_id)
     live = [s["dataModelId"] for s in sources if s.get("type") == "data-model"]
     parameters = find_source_parameters(spec)
     controls = {
         data_model_id: data_model_control_targets(
-            client.get_data_model_spec(data_model_id)
+            client.get_spec(DATA_MODEL, data_model_id)
         )
         for data_model_id in live
     }
     findings = plan_repairs(
         parameters, live, controls, control_renames, preferred_data_model_id
     )
-    return spec, live, findings
+    return Analysis(kind, spec, live, findings, parameters, controls)
 
 
-def _print_report(spec: dict, live: list[str], findings: list[Finding]) -> None:
-    print(f"workbook : {spec.get('name')}  (version {spec.get('documentVersion')})")
-    print(f"reads from: {', '.join(live) if live else '(no data-model sources)'}")
-    print(f"source parameters: {len(findings)}")
-    if not findings:
-        print("\nThis workbook has no data-model source parameters.")
+def _print_report(analysis: Analysis) -> None:
+    spec = analysis.spec
+    print(f"{analysis.kind}: {spec.get('name')}  "
+          f"(version {spec.get('documentVersion')})")
+    print(f"reads from: {', '.join(analysis.live) if analysis.live else '(none)'}")
+    print(f"source parameters: {len(analysis.findings)}")
+    if not analysis.findings:
+        print(f"\nThis {analysis.kind} has no data-model source parameters.")
         return
     print()
-    for finding in findings:
+    for finding in analysis.findings:
         p = finding.parameter
-        print(f"  [{_LABEL[finding.status]}] {p.element_name or p.workbook_control_id!r}"
+        print(f"  [{_LABEL[finding.status]}] {p.element_name or p.own_control_id!r}"
               f"  (element {p.element_id})")
         print(f"             data model control: {p.dm_control_id}")
         if finding.status == HEALTHY:
@@ -684,9 +708,6 @@ def _print_report(spec: dict, live: list[str], findings: list[Finding]) -> None:
         if finding.status == MISSING_CONTROL and finding.available_control_ids:
             print(f"             controls available: "
                   f"{', '.join(finding.available_control_ids)}")
-        if finding.status == MISMATCH and finding.parameter.source_dm_element_id:
-            print(f"             reads element: "
-                  f"{finding.parameter.source_dm_element_id}")
         print()
 
 
@@ -697,15 +718,15 @@ def _summary(findings: list[Finding]) -> dict[str, int]:
     return counts
 
 
-def _emit_json(workbook_id: str, spec: dict, live: list[str],
-               findings: list[Finding], **extra: Any) -> None:
+def _emit_json(document_id: str, analysis: Analysis, **extra: Any) -> None:
     print(json.dumps(
         {
-            "workbook": spec.get("name"),
-            "workbookId": workbook_id,
-            "liveDataModelIds": live,
-            "summary": _summary(findings),
-            "findings": [f.to_dict() for f in findings],
+            "documentKind": analysis.kind,
+            "document": analysis.spec.get("name"),
+            "documentId": document_id,
+            "liveDataModelIds": analysis.live,
+            "summary": _summary(analysis.findings),
+            "findings": [f.to_dict() for f in analysis.findings],
             **extra,
         },
         indent=2,
@@ -719,130 +740,149 @@ def _mappings_from_args(args: argparse.Namespace) -> dict[str, str]:
             with open(args.map_file, encoding="utf-8") as handle:
                 mapping.update(load_control_map_file(handle.read()))
         except OSError as exc:
-            raise SigmaError(f"could not read --map-file: {exc}") from exc
+            raise SigmaConfigError(f"could not read --map-file: {exc}") from exc
         except ValueError as exc:
-            raise SigmaError(str(exc)) from exc
+            raise SigmaConfigError(str(exc)) from exc
     try:
         mapping.update(parse_control_map(getattr(args, "map", None) or []))
     except ValueError as exc:
-        raise SigmaError(str(exc)) from exc
+        raise SigmaConfigError(str(exc)) from exc
     return mapping
 
 
-def cmd_check(client: SigmaClient, args: argparse.Namespace) -> int:
+def _prepare(client: SigmaClient, args: argparse.Namespace) -> tuple[Analysis, dict]:
+    kind = {"workbook": WORKBOOK, "datamodel": DATA_MODEL}.get(
+        getattr(args, "type", None) or "", None
+    ) or client.detect_kind(args.document_id)
     renames = _mappings_from_args(args)
-    spec, live, findings = analyze(client, args.workbook_id, renames, args.data_model)
+    preferred = None
+    if args.data_model:
+        preferred = client.resolve_data_model_id(args.data_model)
+    analysis = analyze(client, kind, args.document_id, renames, preferred)
+    if preferred and preferred not in analysis.live:
+        raise SigmaConfigError(
+            f"--data-model {args.data_model!r} resolved to {preferred}, which is "
+            f"not one of this {kind}'s live sources "
+            f"({', '.join(analysis.live) or 'none'})."
+        )
+    return analysis, renames
+
+
+def cmd_check(client: SigmaClient, args: argparse.Namespace) -> int:
+    analysis, renames = _prepare(client, args)
     if args.json:
-        _emit_json(args.workbook_id, spec, live, findings, appliedMappings=renames)
+        _emit_json(args.document_id, analysis, appliedMappings=renames)
     else:
-        _print_report(spec, live, findings)
-    broken = [f for f in findings if f.needs_attention]
+        _print_report(analysis)
+    broken = [f for f in analysis.findings if f.needs_attention]
     if not args.json:
         if broken:
             print(f"{len(broken)} source parameter(s) need attention.")
-        elif findings:
+        elif analysis.findings:
             print("All source parameters resolve to a live source.")
+            print("Whether Sigma accepts each target is only settled by a write; "
+                  "run `repair --apply` to find out.")
     return EXIT_FINDINGS if broken else EXIT_OK
 
 
-def cmd_repair(client: SigmaClient, args: argparse.Namespace) -> int:
-    renames = _mappings_from_args(args)
-    spec, live, findings = analyze(client, args.workbook_id, renames, args.data_model)
+def _blocked_hint(unresolved: list[Finding]) -> str:
+    """Suggest only the flags that match what is actually unresolved."""
+    kinds = {f.status for f in unresolved}
+    parts = []
+    if MISSING_CONTROL in kinds:
+        parts.append("--map OLD_CONTROL_ID=NEW_CONTROL_ID")
+    if AMBIGUOUS in kinds:
+        parts.append("--data-model ID")
+    return " or ".join(parts) if parts else "an explicit mapping"
 
-    repairable = [f for f in findings if f.status == REPAIRABLE]
-    unresolved = blocking_findings(findings)
+
+def cmd_repair(client: SigmaClient, args: argparse.Namespace) -> int:
+    analysis, renames = _prepare(client, args)
+    repairable = [f for f in analysis.findings if f.status == REPAIRABLE]
+    unresolved = blocking_findings(analysis.findings)
 
     if not args.json:
-        _print_report(spec, live, findings)
+        _print_report(analysis)
 
-    # A partial write is not possible — see blocking_findings().
     if unresolved:
         if args.json:
-            _emit_json(args.workbook_id, spec, live, findings, applied=False,
-                       blocked=True, wouldRepair=len(repairable),
-                       appliedMappings=renames)
+            _emit_json(args.document_id, analysis, applied=False, blocked=True,
+                       wouldRepair=len(repairable), appliedMappings=renames)
         else:
-            print(f"Cannot write: {len(unresolved)} binding(s) could not be "
-                  f"resolved.")
-            print("Sigma validates the whole spec on write, so a partial repair "
-                  "cannot be saved — an unresolved binding would reject the "
-                  "write and nothing would change.")
-            print("Resolve the remaining binding(s) with --map "
-                  "OLD_CONTROL_ID=NEW_CONTROL_ID (or --data-model to pick "
-                  "between sources), then run again.")
-            hints = [
-                f"  --map {f.parameter.dm_control_id}={f.suggested_control_ids[0]}"
-                for f in unresolved
-                if f.suggested_control_ids
-                and _name_stem(f.suggested_control_ids[0])
-                == _name_stem(f.parameter.dm_control_id)
-            ]
-            if hints:
-                print("\nSuggested:")
-                for hint in dict.fromkeys(hints):
-                    print(hint)
+            print(f"Cannot write: {len(unresolved)} binding(s) could not be resolved.")
+            print(f"Sigma validates the whole spec on write, so a partial repair "
+                  f"cannot be saved. Resolve them with {_blocked_hint(unresolved)}, "
+                  f"then run again.")
             if repairable:
-                print(f"\n{len(repairable)} other binding(s) are ready and will "
-                      f"be written in the same pass once the rest resolve.")
+                print(f"\n{len(repairable)} other binding(s) are ready and will be "
+                      f"written in the same pass once the rest resolve.")
         return EXIT_FINDINGS
 
     if not repairable:
         if args.json:
-            _emit_json(args.workbook_id, spec, live, findings,
-                       applied=False, appliedMappings=renames)
+            _emit_json(args.document_id, analysis, applied=False,
+                       appliedMappings=renames)
         else:
             print("Nothing to repair.")
         return EXIT_OK
 
     if not args.apply:
         if args.json:
-            _emit_json(args.workbook_id, spec, live, findings,
-                       applied=False, wouldRepair=len(repairable),
-                       appliedMappings=renames)
+            _emit_json(args.document_id, analysis, applied=False,
+                       wouldRepair=len(repairable), appliedMappings=renames)
         else:
             print(f"Dry run — {len(repairable)} binding(s) would be rewritten.")
             print("Re-run with --apply to write the change.")
         return EXIT_OK
 
-    changed = apply_repairs(findings)
-    client.update_workbook_spec(args.workbook_id, spec_to_update_body(spec))
+    changed = apply_repairs(analysis.findings)
+    try:
+        client.update_spec(
+            analysis.kind, args.document_id,
+            spec_to_update_body(analysis.spec, analysis.kind),
+        )
+    except SigmaError as exc:
+        explanation = explain_rejection(
+            str(exc), analysis.parameters, analysis.controls
+        )
+        print(f"\nThe write was refused, so nothing changed.\n", file=sys.stderr)
+        print(explanation, file=sys.stderr)
+        return EXIT_FINDINGS
 
-    after_spec, after_live, after = analyze(
-        client, args.workbook_id, renames, args.data_model
-    )
-    still_broken = [f for f in after if f.needs_attention]
-
+    after, _ = _prepare(client, args)
+    still_broken = [f for f in after.findings if f.needs_attention]
     if args.json:
-        _emit_json(args.workbook_id, after_spec, after_live, after,
-                   applied=True, repaired=changed,
+        _emit_json(args.document_id, after, applied=True, repaired=changed,
                    stillNeedingAttention=len(still_broken),
                    appliedMappings=renames)
     else:
-        print(f"Applied — rewrote {changed} binding(s). A new workbook version was "
-              f"created; the previous version is still available in Sigma.")
+        print(f"Applied — rewrote {changed} binding(s). A new version was created; "
+              f"the previous one is still available in Sigma.")
         print(f"Verified — {len(still_broken)} source parameter(s) still need "
               f"attention.")
     return EXIT_FINDINGS if still_broken else EXIT_OK
 
 
-def _add_resolution_flags(parser: argparse.ArgumentParser) -> None:
+def _add_common_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("document_id",
+                        help="workbook or data model id (UUID or url id)")
     parser.add_argument(
-        "--map",
-        action="append",
-        metavar="OLD=NEW",
+        "--type", choices=["workbook", "datamodel"],
+        help="skip auto-detection of the document type",
+    )
+    parser.add_argument(
+        "--map", action="append", metavar="OLD=NEW",
         help="rename a data-model control id, for controls renamed between "
              "template and clone. Repeatable.",
     )
     parser.add_argument(
-        "--map-file",
-        metavar="PATH",
+        "--map-file", metavar="PATH",
         help="read control-id renames from a JSON object or OLD=NEW lines",
     )
     parser.add_argument(
-        "--data-model",
-        metavar="ID",
+        "--data-model", metavar="ID",
         help="prefer this data model when several live sources define the same "
-             "control id",
+             "control id (UUID or url id)",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON")
 
@@ -850,7 +890,8 @@ def _add_resolution_flags(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sigma-source-params",
-        description="Detect and repair broken Sigma workbook source parameters.",
+        description="Detect and repair broken Sigma source parameters in "
+                    "workbooks and data models.",
         epilog="Credentials come from SIGMA_BASE_URL, SIGMA_CLIENT_ID and "
                "SIGMA_CLIENT_SECRET.",
     )
@@ -858,29 +899,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     check = subparsers.add_parser(
-        "check",
-        help="report stale source parameters; exits 1 if any are found",
-        description="Report on a workbook's source parameters without changing "
-                    "anything. Exits 1 when any binding needs attention, so it "
-                    "can gate a rollout pipeline.",
-    )
-    check.add_argument("workbook_id", help="workbook id or url id")
-    _add_resolution_flags(check)
+        "check", help="report stale source parameters; exits 1 if any are found")
+    _add_common_flags(check)
     check.set_defaults(func=cmd_check)
 
     repair = subparsers.add_parser(
-        "repair",
-        help="rewrite stale source parameters (dry run unless --apply)",
-        description="Rewrite each stale parameters[].dataModelId to the data "
-                    "model the workbook actually reads from. Dry run by default.",
-    )
-    repair.add_argument("workbook_id", help="workbook id or url id")
+        "repair", help="rewrite stale source parameters (dry run unless --apply)")
+    _add_common_flags(repair)
     repair.add_argument(
-        "--apply",
-        action="store_true",
-        help="write the change (creates a new workbook version)",
+        "--apply", action="store_true",
+        help="write the change (creates a new version)",
     )
-    _add_resolution_flags(repair)
     repair.set_defaults(func=cmd_repair)
     return parser
 
@@ -890,10 +919,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         client = SigmaClient.from_env()
         return args.func(client, args)
+    except SigmaConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
     except SigmaError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        if "environment variable" in str(exc) or "mapping" in str(exc):
-            return EXIT_CONFIG
         return EXIT_API
     except KeyboardInterrupt:
         return 130

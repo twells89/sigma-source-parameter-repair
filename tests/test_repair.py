@@ -92,7 +92,7 @@ class TestFindSourceParameters(unittest.TestCase):
         found = find_source_parameters(spec)
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0].element_id, "c1")
-        self.assertEqual(found[0].workbook_control_id, "RegionControl")
+        self.assertEqual(found[0].own_control_id, "RegionControl")
         self.assertEqual(found[0].dm_control_id, "Store-Region")
         self.assertEqual(found[0].data_model_id, OLD_DM)
 
