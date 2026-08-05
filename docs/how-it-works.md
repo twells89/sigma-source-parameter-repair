@@ -66,21 +66,42 @@ The practical consequence is that all the stale bindings in a freshly swapped wo
 | `GET /v2/dataModels/{id}/spec?format=json` | Read a data model, to enumerate its control ids |
 | `PUT /v2/workbooks/{id}/spec` | Write the repaired workbook |
 
-### The PUT body
+### The document envelope, and why layout gets lost
 
-`GET` returns read-only metadata that `PUT` will not accept. The body must be reduced to:
+`GET` returns read-only metadata around the document. **Workbooks nest the
+document under a `document` key; data models return it flat.** Both carry a
+`kind` field.
 
-```json
-{
-  "schemaVersion": 1,
-  "pages": [ ... ],
-  "layout": "<optional>",
-  "themeName": "<optional>",
-  "themeOverrides": { }
-}
+```
+workbook   {workbookId, name, url, documentVersion, ..., document: {kind, layout, pages, schemaVersion}}
+data model {dataModelId, name, url, documentVersion, ..., kind, pages, schemaVersion}
 ```
 
-Dropping `workbookId`, `name`, `url`, `documentVersion`, `ownerId`, `folderId`, `createdBy`, `updatedBy`, `createdAt` and `updatedAt` is handled by `spec_to_update_body()`.
+Writes mirror that: a workbook `PUT` body is `{"document": {...}}` and a flat one
+is rejected with `Expecting { schemaVersion: 1 } at 0.document`; a data model
+takes the document flat and rejects the wrapper with `Syntax error in data model
+spec`.
+
+The dangerous part is what happens when a field is *omitted* rather than wrong.
+Measured, holding everything else constant:
+
+| Body | Result |
+| --- | --- |
+| the whole document | accepted, layout byte-identical |
+| without `kind` | **rejected** |
+| without `layout` | **accepted — Sigma regenerates the layout** |
+| `layout: null` | **accepted — Sigma regenerates the layout** |
+| only `schemaVersion` + `pages` | **rejected** |
+
+A regenerated layout means every element is repositioned: the controls move.
+Nothing in the response tells you it happened.
+
+So the document is sent back **whole** — `unwrap_document()` splits the envelope
+off, the bindings are mutated in place, and `document_for_write()` returns the
+same dict with nothing removed. `ENVELOPE_METADATA` is a *denylist* of read-only
+fields rather than an allowlist of known content, so a field this tool has never
+heard of still survives the round trip. Cherry-picking known keys is precisely
+the bug.
 
 `PUT` **replaces** the workbook with the supplied representation and creates a new version. It does not destroy the previous one — earlier versions remain in Sigma's version history — but it does mean you must send the whole spec, not a patch. Always read immediately before writing.
 

@@ -12,7 +12,9 @@ everything it made:
        original, and `swapSources` onto the clone — the real breakage
   3.   assert `check` reports repairable bindings plus one NO MATCH
   4.   assert `repair --apply` refuses to write while anything is unresolved
-  5.   assert one `--map` unblocks every binding atomically, and is idempotent
+  5.   assert one `--map` unblocks every binding atomically, is idempotent, and
+       leaves the layout byte-identical (a write that omits `layout` is accepted
+       and Sigma regenerates it, moving every element)
   6.   assert the result validates server-side
   7.   assert a rejection from Sigma is translated into guidance rather than
        predicted up front
@@ -46,6 +48,7 @@ from sigma_source_params import (  # noqa: E402
     SigmaError,
     data_model_control_ids,
     iter_elements,
+    unwrap_document,
 )
 
 WORKBOOK_KIND, DATA_MODEL_KIND = WORKBOOK, DATA_MODEL
@@ -105,6 +108,43 @@ def statuses(payload: dict) -> dict[str, str]:
 # --------------------------------------------------------------------------
 
 
+def post_spec(client: SigmaClient, kind: str, name: str, folder_id: str,
+              document: dict) -> str:
+    """Create a workbook or data model, tolerating either body shape.
+
+    Workbooks moved to a `document` wrapper; data models have not. Rather than
+    hard-code which is which, try wrapped and fall back to flat on a shape error.
+    """
+    base = "workbooks" if kind == WORKBOOK else "dataModels"
+    key = "workbookId" if kind == WORKBOOK else "dataModelId"
+    attempts = [
+        {"name": name, "folderId": folder_id, "document": document},
+        {"name": name, "folderId": folder_id, **document},
+    ]
+    last = None
+    for body in attempts:
+        try:
+            created = client.call("POST", f"/v2/{base}/spec", body)
+        except SigmaError as exc:
+            # Either shape can be the wrong one, and the endpoints disagree on
+            # how they say so ("Expecting { schemaVersion: 1 } at 0.document"
+            # vs "Syntax error in data model spec"). Retry rather than parse.
+            last = exc
+            if "HTTP 400" in str(exc):
+                continue
+            raise
+        doc_id = created_id(created, key) or _find_inode(client, name, base)
+        _created.append((kind, doc_id))
+        return doc_id
+    raise AssertionError(f"could not create {kind} {name!r}: {last}")
+
+
+def get_content(client: SigmaClient, kind: str, doc_id: str) -> dict:
+    """The writable document, whichever shape the endpoint returns."""
+    content, _ = unwrap_document(client.get_spec(kind, doc_id))
+    return content
+
+
 def build_renamed_clone(client: SigmaClient, source_spec: dict, victim: str,
                         renamed: str, folder_id: str) -> str:
     """Clone a data model, renaming one of its controls."""
@@ -113,18 +153,10 @@ def build_renamed_clone(client: SigmaClient, source_spec: dict, victim: str,
         for element in iter_elements(page.get("elements")):
             if element.get("kind") == "control" and element.get("controlId") == victim:
                 element["controlId"] = renamed
-    body = {
-        "name": f"{PREFIX}-clone-{int(time.time())}",
-        "folderId": folder_id,
-        "schemaVersion": spec["schemaVersion"],
-        "pages": spec["pages"],
-    }
-    created = client._call("POST", "/v2/dataModels/spec", body)
-    dm_id = created_id(created, "dataModelId") or _find_inode(
-        client, body["name"], "dataModels"
+    return post_spec(
+        client, DATA_MODEL, f"{PREFIX}-clone-{int(time.time())}", folder_id,
+        {k: v for k, v in spec.items() if k in ("kind", "schemaVersion", "pages")},
     )
-    _created.append(("data model", dm_id))
-    return dm_id
 
 
 def dm_control_details(dm_spec: dict) -> dict[str, tuple[str | None, str | None]]:
@@ -204,18 +236,26 @@ def build_workbook(client: SigmaClient, dm_id: str, element_id: str,
                 "columnId": wb_column,
             }
         elements.append(control)
-    body = {
-        "name": f"{PREFIX}-workbook-{int(time.time())}",
-        "folderId": folder_id,
-        "schemaVersion": 1,
-        "pages": [{"id": "e2ePage01", "name": "Page 1", "elements": elements}],
-    }
-    created = client._call("POST", "/v2/workbooks/spec", body)
-    wb_id = created_id(created, "workbookId") or _find_inode(
-        client, body["name"], "workbooks"
+    # An explicit layout, so the fixture actually exercises layout preservation.
+    # Earlier fixtures had none, which is why a layout-destroying write went
+    # unnoticed by this test.
+    rows = [f'    <LayoutElement elementId="{e["id"]}" '
+            f'gridColumn="1 / 13" gridRow="{i * 3 + 1} / {i * 3 + 4}"/>'
+            for i, e in enumerate(elements)]
+    layout = ('<?xml version="1.0" encoding="utf-8"?>\n'
+              '<Page type="grid" gridTemplateColumns="repeat(24, 1fr)" '
+              'gridTemplateRows="auto" id="e2ePage01">\n'
+              + "\n".join(rows) + "\n</Page>\n")
+
+    return post_spec(
+        client, WORKBOOK, f"{PREFIX}-workbook-{int(time.time())}", folder_id,
+        {
+            "kind": "workbook",
+            "schemaVersion": 1,
+            "layout": layout,
+            "pages": [{"id": "e2ePage01", "name": "Page 1", "elements": elements}],
+        },
     )
-    _created.append(("workbook", wb_id))
-    return wb_id
 
 
 def build_retargeted_clone(client: SigmaClient, source_spec: dict, victim: str,
@@ -248,18 +288,10 @@ def build_retargeted_clone(client: SigmaClient, source_spec: dict, victim: str,
                 "source": {"kind": "table", "elementId": new_target_element},
                 "columnId": column,
             }
-    body = {
-        "name": f"{PREFIX}-retargeted-{int(time.time())}",
-        "folderId": folder_id,
-        "schemaVersion": spec["schemaVersion"],
-        "pages": spec["pages"],
-    }
-    created = client._call("POST", "/v2/dataModels/spec", body)
-    dm_id = created_id(created, "dataModelId") or _find_inode(
-        client, body["name"], "dataModels"
+    return post_spec(
+        client, DATA_MODEL, f"{PREFIX}-retargeted-{int(time.time())}", folder_id,
+        {k: v for k, v in spec.items() if k in ("kind", "schemaVersion", "pages")},
     )
-    _created.append(("data model", dm_id))
-    return dm_id
 
 
 def created_id(response: Any, key: str) -> str | None:
@@ -397,12 +429,7 @@ def build_child_data_model(client: SigmaClient, parent_dm: str, parent_element: 
             control,
         ]}],
     }
-    created = client._call("POST", "/v2/dataModels/spec", body)
-    dm_id = created_id(created, "dataModelId") or _find_inode(
-        client, body["name"], "dataModels"
-    )
-    _created.append(("data model", dm_id))
-    return dm_id
+    return post_spec(client, DATA_MODEL, body.pop("name"), body.pop("folderId"), body)
 
 
 def cleanup(client: SigmaClient) -> None:
@@ -553,6 +580,10 @@ def main() -> int:
         )
 
         print("\n4. one mapping unblocks the whole repair, atomically")
+        layout_before = get_content(client, WORKBOOK, wb_id).get("layout")
+        check("the fixture has a layout to preserve",
+              bool((layout_before or "").strip()),
+              "without one, layout preservation is not being tested at all")
         code, payload = run_cli(
             "repair", wb_id, "--map", f"{victim}={renamed}", "--apply"
         )
@@ -567,6 +598,15 @@ def main() -> int:
             payload["stillNeedingAttention"] == 0,
             f"remaining={payload['stillNeedingAttention']}",
         )
+
+        layout_after = get_content(client, WORKBOOK, wb_id).get("layout")
+        check("the layout is byte-identical after the repair",
+              layout_after == layout_before,
+              f"before {len(layout_before or '')} chars, "
+              f"after {len(layout_after or '')} chars — elements moved")
+        check("the tool itself reports the layout unchanged",
+              payload.get("layoutUnchanged") is True,
+              f"layoutUnchanged={payload.get('layoutUnchanged')}")
 
         print("\n5. the repair is idempotent")
         code, payload = run_cli("check", wb_id)
@@ -584,16 +624,11 @@ def main() -> int:
         # POST rejects any spec containing an invalid source parameter, so a
         # successful round-trip is Sigma's own confirmation that the bindings
         # are sound. Nothing is created when it rejects.
-        spec = client.get_spec(WORKBOOK, wb_id)
-        probe = {
-            "name": f"{PREFIX}-validation-probe-{int(time.time())}",
-            "folderId": folder_id,
-            "schemaVersion": spec["schemaVersion"],
-            "pages": spec["pages"],
-        }
+        content = get_content(client, WORKBOOK, wb_id)
         try:
-            created = client._call("POST", "/v2/workbooks/spec", probe)
-            _created.append(("workbook", created_id(created, "workbookId")))
+            post_spec(client, WORKBOOK,
+                      f"{PREFIX}-validation-probe-{int(time.time())}",
+                      folder_id, content)
             check("Sigma accepts the repaired spec", True)
         except SigmaError as exc:
             check("Sigma accepts the repaired spec", False, str(exc))
