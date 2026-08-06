@@ -154,6 +154,16 @@ def find_source_parameters(spec: dict) -> list[SourceParameter]:
     return found
 
 
+def count_elements(spec: dict) -> tuple[int, int]:
+    """(pages, control elements) — used to tell an empty result from a misread one."""
+    pages = spec.get("pages") or []
+    controls = sum(
+        1 for page in pages for e in iter_elements(page.get("elements"))
+        if e.get("kind") == "control"
+    )
+    return len(pages), controls
+
+
 def data_model_control_targets(dm_spec: dict) -> dict[str, str | None]:
     """Control id -> the data-model element that control filters."""
     targets: dict[str, str | None] = {}
@@ -506,8 +516,9 @@ def explain_rejection(
                      "column of an element this document reads — then re-run;")
         lines.append("    - or remove the source parameter if it is no longer "
                      "wanted.")
-        lines.append("  Note the UI can display such a control quite happily; it "
-                     "is the spec API that will not write it.")
+        lines.append("  This is usually a half-configured control — a source "
+                     "parameter was added but no value source was ever chosen. "
+                     "Sigma's editor flags it too, as an invalid selection.")
         return "\n".join(lines)
 
     reads = param.source_dm_element_id if param else None
@@ -730,6 +741,8 @@ class Analysis:
     findings: list[Finding]
     parameters: list[SourceParameter]
     controls: dict[str, dict[str, str | None]]
+    page_count: int = 0
+    control_count: int = 0
 
     @property
     def kind(self) -> str:
@@ -754,7 +767,9 @@ def analyze(
     findings = plan_repairs(
         parameters, live, controls, control_renames, preferred_data_model_id
     )
-    return Analysis(document, live, findings, parameters, controls)
+    pages, control_elements = count_elements(document.content)
+    return Analysis(document, live, findings, parameters, controls,
+                    pages, control_elements)
 
 
 def _print_report(analysis: Analysis) -> None:
@@ -763,7 +778,10 @@ def _print_report(analysis: Analysis) -> None:
     print(f"reads from: {', '.join(analysis.live) if analysis.live else '(none)'}")
     print(f"source parameters: {len(analysis.findings)}")
     if not analysis.findings:
-        print(f"\nThis {analysis.kind} has no data-model source parameters.")
+        print()
+        for line in empty_result_note(analysis.kind, analysis.page_count,
+                                      analysis.control_count):
+            print(line)
         return
     print()
     for finding in analysis.findings:
@@ -788,6 +806,28 @@ def _print_report(analysis: Analysis) -> None:
         print()
 
 
+def empty_result_note(kind: str, pages: int, controls: int) -> list[str]:
+    """Explain a zero result, so a misread response cannot look like a clean bill.
+
+    A silent zero is the worst failure this tool can have: as a rollout gate it
+    would wave a broken document straight through. Say what was actually seen.
+    """
+    if pages == 0:
+        return [
+            "No pages were found in the API response.",
+            "That almost certainly means this version does not understand the "
+            "shape the API returned, rather than that the document is empty.",
+            f"Check for a newer release — this is {__version__}.",
+        ]
+    if controls == 0:
+        return [f"Scanned {pages} page(s); this {kind} has no control elements, "
+                f"so there is nothing that could carry a source parameter."]
+    return [f"Scanned {pages} page(s) and {controls} control element(s); none "
+            f"carries a data-model source parameter.",
+            "If you expect one here, check that this version is current — "
+            f"this is {__version__}."]
+
+
 def _summary(findings: list[Finding]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for finding in findings:
@@ -802,6 +842,8 @@ def _emit_json(document_id: str, analysis: Analysis, **extra: Any) -> None:
             "document": analysis.document.name,
             "documentId": document_id,
             "liveDataModelIds": analysis.live,
+            "pagesScanned": analysis.page_count,
+            "controlElements": analysis.control_count,
             "summary": _summary(analysis.findings),
             "findings": [f.to_dict() for f in analysis.findings],
             **extra,
@@ -859,6 +901,10 @@ def cmd_check(client: SigmaClient, args: argparse.Namespace) -> int:
             print("All source parameters resolve to a live source.")
             print("Whether Sigma accepts each target is only settled by a write; "
                   "run `repair --apply` to find out.")
+    if analysis.page_count == 0:
+        # Could not interpret the response. Never exit clean on that — as a gate
+        # it would be indistinguishable from a healthy document.
+        return EXIT_API
     return EXIT_FINDINGS if broken else EXIT_OK
 
 

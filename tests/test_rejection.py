@@ -148,8 +148,8 @@ class TestControlWithNoValueSource(unittest.TestCase):
     """Sigma refuses a source parameter on a control that declares no `source`.
 
     Measured: every binding on such a control is refused, repaired or not, on
-    both POST and PUT. The UI displays these controls without complaint, so the
-    message has to be specific or it reads as a tool failure.
+    both POST and PUT. Give the control a value source and the same binding is
+    accepted, so the message must point at the value source, not the binding.
     """
 
     def _spec(self):
@@ -182,11 +182,13 @@ class TestControlWithNoValueSource(unittest.TestCase):
         self.assertIn("give the control a value source", text)
         self.assertIn("remove the source parameter", text)
 
-    def test_it_says_the_ui_tolerates_what_the_api_refuses(self):
+    def test_it_describes_the_state_without_overclaiming_about_the_ui(self):
+        """Sigma's editor flags this too — do not imply the UI is happy with it."""
         text = explain_rejection(
             MESSAGE, find_source_parameters(self._spec()), {DM: TARGETS}
         )
-        self.assertIn("UI can display", text)
+        self.assertIn("half-configured", text)
+        self.assertNotIn("quite happily", text)
 
     def test_it_does_not_offer_a_map_it_cannot_justify(self):
         """With no value source there are no candidate controls to suggest."""
