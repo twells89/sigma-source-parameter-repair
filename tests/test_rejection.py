@@ -142,3 +142,55 @@ class TestExplainRejection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestControlWithNoValueSource(unittest.TestCase):
+    """Sigma refuses a source parameter on a control that declares no `source`.
+
+    Measured: every binding on such a control is refused, repaired or not, on
+    both POST and PUT. The UI displays these controls without complaint, so the
+    message has to be specific or it reads as a tool failure.
+    """
+
+    def _spec(self):
+        s = spec("wbStore")
+        for page in s["pages"]:
+            for element in page["elements"]:
+                if element.get("kind") == "control":
+                    del element["source"]          # the shape seen in the wild
+        return s
+
+    def test_the_missing_value_source_is_recorded(self):
+        param = find_source_parameters(self._spec())[0]
+        self.assertFalse(param.has_value_source)
+        self.assertIsNone(param.source_dm_element_id)
+
+    def test_a_resolvable_source_is_still_recorded_as_present(self):
+        param = find_source_parameters(spec("wbStore"))[0]
+        self.assertTrue(param.has_value_source)
+
+    def test_the_explanation_names_the_real_cause(self):
+        text = explain_rejection(
+            MESSAGE, find_source_parameters(self._spec()), {DM: TARGETS}
+        )
+        self.assertIn("no value source", text)
+
+    def test_it_offers_both_remedies(self):
+        text = explain_rejection(
+            MESSAGE, find_source_parameters(self._spec()), {DM: TARGETS}
+        )
+        self.assertIn("give the control a value source", text)
+        self.assertIn("remove the source parameter", text)
+
+    def test_it_says_the_ui_tolerates_what_the_api_refuses(self):
+        text = explain_rejection(
+            MESSAGE, find_source_parameters(self._spec()), {DM: TARGETS}
+        )
+        self.assertIn("UI can display", text)
+
+    def test_it_does_not_offer_a_map_it_cannot_justify(self):
+        """With no value source there are no candidate controls to suggest."""
+        text = explain_rejection(
+            MESSAGE, find_source_parameters(self._spec()), {DM: TARGETS}
+        )
+        self.assertNotIn("--map", text)

@@ -95,6 +95,12 @@ class SourceParameter:
     Not used to judge validity — only to suggest candidates once Sigma has
     rejected a binding.
     """
+    has_value_source: bool = True
+    """False when the control declares no `source` at all.
+
+    Sigma will not accept a source parameter on such a control, so this
+    distinguishes "no value source" from "a value source we could not resolve".
+    """
 
 
 def element_source_map(spec: dict) -> dict[str, str]:
@@ -142,6 +148,7 @@ def find_source_parameters(spec: dict) -> list[SourceParameter]:
                         dm_control_id=param.get("controlId", ""),
                         raw=param,
                         source_dm_element_id=sources.get(value_source),
+                        has_value_source=value_source is not None,
                     )
                 )
     return found
@@ -487,6 +494,20 @@ def explain_rejection(
                      f"{target_control!r}.")
         if dm_controls:
             lines.append(f"  it defines: {', '.join(sorted(dm_controls))}")
+        return "\n".join(lines)
+
+    if param is not None and not param.has_value_source:
+        lines.append(f"  the control declares no value source, and Sigma will "
+                     f"not accept a source parameter on a control that has none "
+                     f"(measured: every binding is refused, with or without the "
+                     f"parameter repaired).")
+        lines.append("  Fix it one of two ways:")
+        lines.append("    - give the control a value source in the Sigma UI — a "
+                     "column of an element this document reads — then re-run;")
+        lines.append("    - or remove the source parameter if it is no longer "
+                     "wanted.")
+        lines.append("  Note the UI can display such a control quite happily; it "
+                     "is the spec API that will not write it.")
         return "\n".join(lines)
 
     reads = param.source_dm_element_id if param else None
@@ -901,7 +922,8 @@ def cmd_repair(client: SigmaClient, args: argparse.Namespace) -> int:
         explanation = explain_rejection(
             str(exc), analysis.parameters, analysis.controls
         )
-        print(f"\nThe write was refused, so nothing changed.\n", file=sys.stderr)
+        sys.stdout.flush()  # keep the report above the error, not interleaved
+        print("\nThe write was refused, so nothing changed.\n", file=sys.stderr)
         print(explanation, file=sys.stderr)
         return EXIT_FINDINGS
 
