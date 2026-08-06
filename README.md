@@ -105,9 +105,17 @@ Write the change:
 python3 sigma_source_params.py repair WORKBOOK_ID --apply
 ```
 
-`--apply` creates a **new workbook version**. The previous version stays available in Sigma's version history, so the change is revertible.
+`--apply` creates a **new version**. The previous version stays available in Sigma's version history, so the change is revertible.
 
-After writing, the tool re-reads the workbook and reports how many bindings still need attention, rather than assuming the write worked.
+After writing, the tool re-reads the document and reports how many bindings still need attention, rather than assuming the write worked. It also confirms the **layout is byte-identical** and warns loudly if it is not:
+
+```
+Applied — rewrote 3 binding(s). A new version was created; the previous one is still available in Sigma.
+Verified — 0 source parameter(s) still need attention.
+Verified — the layout is byte-identical; nothing moved.
+```
+
+Layout preservation is not incidental. Sigma accepts a write whose body omits `layout` and silently **regenerates** it, which repositions every element on the page. The tool therefore sends the document back whole rather than reassembling it from the fields it knows about — see [How it works](docs/how-it-works.md#the-document-envelope-and-why-layout-gets-lost).
 
 ## Resolution rules
 

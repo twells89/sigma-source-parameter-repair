@@ -4,6 +4,7 @@ Data models carry source parameters in exactly the same `parameters[]` shape, so
 the analysis core is shared. Only the endpoints and two response shapes differ.
 """
 
+import json
 import os
 import sys
 import unittest
@@ -21,7 +22,8 @@ from sigma_source_params import (  # noqa: E402
     element_source_map,
     find_source_parameters,
     plan_repairs,
-    spec_to_update_body,
+    unwrap_document,
+    document_for_write,
 )
 
 OLD_DM = "11111111-1111-1111-1111-111111111111"
@@ -71,24 +73,71 @@ def data_model_spec():
     }
 
 
-class TestSpecToUpdateBody(unittest.TestCase):
-    SPEC = {"schemaVersion": 1, "pages": [], "layout": "<Page/>",
-            "themeName": "Dark", "themeOverrides": {"a": 1},
-            "name": "x", "documentVersion": 3}
+class TestUnwrapDocument(unittest.TestCase):
+    """Workbooks nest the document; data models return it flat."""
 
-    def test_workbook_keeps_layout_and_theme(self):
-        body = spec_to_update_body(self.SPEC, WORKBOOK)
-        self.assertEqual(set(body),
-                         {"schemaVersion", "pages", "layout", "themeName",
-                          "themeOverrides"})
+    WRAPPED = {
+        "workbookId": "wb1", "name": "X", "documentVersion": 4,
+        "createdAt": "2026-01-01", "url": "https://example.invalid",
+        "document": {"kind": "workbook", "schemaVersion": 1,
+                     "layout": "<Page/>", "pages": []},
+    }
+    FLAT = {
+        "dataModelId": "dm1", "name": "Y", "documentVersion": 2,
+        "ownerId": "someone", "updatedAt": "2026-01-01",
+        "kind": "data-model", "schemaVersion": 1, "pages": [],
+    }
 
-    def test_data_model_takes_only_schema_version_and_pages(self):
-        """A data model's spec endpoint rejects layout and theme."""
-        body = spec_to_update_body(self.SPEC, DATA_MODEL)
-        self.assertEqual(set(body), {"schemaVersion", "pages"})
+    def test_wrapped_returns_the_inner_document(self):
+        content, wrapped = unwrap_document(self.WRAPPED)
+        self.assertTrue(wrapped)
+        self.assertEqual(set(content), {"kind", "schemaVersion", "layout", "pages"})
 
-    def test_defaults_to_workbook(self):
-        self.assertIn("layout", spec_to_update_body(self.SPEC))
+    def test_wrapped_returns_the_live_dict_so_edits_land(self):
+        envelope = json.loads(json.dumps(self.WRAPPED))
+        content, _ = unwrap_document(envelope)
+        content["pages"].append({"id": "new"})
+        self.assertEqual(envelope["document"]["pages"], [{"id": "new"}])
+
+    def test_flat_strips_only_read_only_metadata(self):
+        content, wrapped = unwrap_document(self.FLAT)
+        self.assertFalse(wrapped)
+        self.assertEqual(set(content), {"kind", "schemaVersion", "pages"})
+
+    def test_flat_keeps_unrecognised_content_fields(self):
+        """A denylist, so fields this tool has never heard of still survive."""
+        content, _ = unwrap_document({**self.FLAT, "somethingNew": {"a": 1}})
+        self.assertEqual(content["somethingNew"], {"a": 1})
+
+
+class TestDocumentForWrite(unittest.TestCase):
+    DOC = {"kind": "workbook", "schemaVersion": 1, "layout": "<Page/>", "pages": []}
+
+    def test_wrapped_document_is_nested_for_the_write(self):
+        self.assertEqual(document_for_write(self.DOC, True), {"document": self.DOC})
+
+    def test_flat_document_is_sent_as_is(self):
+        self.assertEqual(document_for_write(self.DOC, False), self.DOC)
+
+    def test_layout_is_never_dropped(self):
+        """Omitting layout is accepted by Sigma and regenerates it, moving
+        every element on the page. So the document goes back whole."""
+        for wrapped in (True, False):
+            body = document_for_write(self.DOC, wrapped)
+            sent = body["document"] if wrapped else body
+            self.assertEqual(sent["layout"], "<Page/>")
+
+    def test_kind_is_never_dropped(self):
+        """`kind` is required — a write without it is rejected."""
+        for wrapped in (True, False):
+            body = document_for_write(self.DOC, wrapped)
+            sent = body["document"] if wrapped else body
+            self.assertIn("kind", sent)
+
+    def test_nothing_is_filtered_out(self):
+        doc = {**self.DOC, "themeName": "Dark", "futureField": 7}
+        body = document_for_write(doc, True)
+        self.assertEqual(body["document"], doc)
 
 
 class TestSourcesShape(unittest.TestCase):

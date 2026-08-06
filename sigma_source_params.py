@@ -42,7 +42,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 # Exit codes, chosen so `check` works as a CI gate.
 EXIT_OK = 0
@@ -381,18 +381,38 @@ def apply_repairs(findings: list[Finding]) -> int:
     return changed
 
 
-def spec_to_update_body(spec: dict, kind: str = WORKBOOK) -> dict:
-    """Reduce a GET spec to the body PUT accepts, dropping read-only metadata.
+# Read-only fields the API returns but will not accept back on a write.
+# A denylist, deliberately: anything else in the response is document content and
+# must survive the round trip, including fields this tool has never heard of.
+ENVELOPE_METADATA = frozenset({
+    "workbookId", "dataModelId", "name", "url", "description",
+    "documentVersion", "latestDocumentVersion", "ownerId", "folderId",
+    "createdBy", "updatedBy", "createdAt", "updatedAt",
+})
 
-    A data model's spec endpoint takes only `schemaVersion` and `pages`; layout
-    and theme are workbook-only and are rejected if sent.
+
+def unwrap_document(envelope: dict) -> tuple[dict, bool]:
+    """Split a GET response into (writable document, was it wrapped).
+
+    Workbooks nest the document under a `document` key; data models return it
+    flat alongside read-only metadata. Returns the live inner dict — mutating
+    its `pages` in place is reflected in what gets written back.
     """
-    body = {"schemaVersion": spec["schemaVersion"], "pages": spec["pages"]}
-    if kind == WORKBOOK:
-        for optional in ("layout", "themeName", "themeOverrides"):
-            if optional in spec:
-                body[optional] = spec[optional]
-    return body
+    document = envelope.get("document")
+    if isinstance(document, dict):
+        return document, True
+    return {k: v for k, v in envelope.items() if k not in ENVELOPE_METADATA}, False
+
+
+def document_for_write(document: dict, wrapped: bool) -> dict:
+    """Wrap the document for the write endpoint, unchanged.
+
+    The document is sent back **whole**. Cherry-picking known fields is how
+    layout gets lost: a body that omits `layout` is accepted and Sigma
+    regenerates it, which moves every element on the page. `kind` is likewise
+    required, and was not a field this tool originally knew about.
+    """
+    return {"document": document} if wrapped else dict(document)
 
 
 # --------------------------------------------------------------------------
@@ -490,6 +510,29 @@ def explain_rejection(
 # --------------------------------------------------------------------------
 # Sigma API client
 # --------------------------------------------------------------------------
+
+
+@dataclass
+class Document:
+    """A workbook or data model, as fetched: envelope plus writable content."""
+
+    kind: str
+    document_id: str
+    envelope: dict = field(repr=False)
+    content: dict = field(repr=False)
+    wrapped: bool
+
+    @property
+    def name(self) -> Any:
+        return self.envelope.get("name")
+
+    @property
+    def version(self) -> Any:
+        return self.envelope.get("documentVersion")
+
+    @property
+    def layout(self) -> Any:
+        return self.content.get("layout")
 
 
 class SigmaError(RuntimeError):
@@ -605,12 +648,25 @@ class SigmaClient:
         return "workbooks" if kind == WORKBOOK else "dataModels"
 
     def get_spec(self, kind: str, document_id: str) -> dict:
+        """The raw GET response — envelope and all."""
         return self.call(
             "GET", f"/v2/{self._base(kind)}/{document_id}/spec?format=json"
         )
 
     def update_spec(self, kind: str, document_id: str, body: dict) -> Any:
         return self.call("PUT", f"/v2/{self._base(kind)}/{document_id}/spec", body)
+
+    def get_document(self, kind: str, document_id: str) -> "Document":
+        envelope = self.get_spec(kind, document_id)
+        content, wrapped = unwrap_document(envelope)
+        return Document(kind, document_id, envelope, content, wrapped)
+
+    def write_document(self, document: "Document") -> Any:
+        return self.update_spec(
+            document.kind,
+            document.document_id,
+            document_for_write(document.content, document.wrapped),
+        )
 
     def get_sources(self, kind: str, document_id: str) -> list[dict]:
         """Normalize the two response shapes: a bare list, or {entries: [...]}."""
@@ -648,12 +704,15 @@ _LABEL = {
 
 @dataclass
 class Analysis:
-    kind: str
-    spec: dict
+    document: Document
     live: list[str]
     findings: list[Finding]
     parameters: list[SourceParameter]
     controls: dict[str, dict[str, str | None]]
+
+    @property
+    def kind(self) -> str:
+        return self.document.kind
 
 
 def analyze(
@@ -663,26 +722,23 @@ def analyze(
     control_renames: dict[str, str] | None = None,
     preferred_data_model_id: str | None = None,
 ) -> Analysis:
-    spec = client.get_spec(kind, document_id)
+    document = client.get_document(kind, document_id)
     sources = client.get_sources(kind, document_id)
     live = [s["dataModelId"] for s in sources if s.get("type") == "data-model"]
-    parameters = find_source_parameters(spec)
-    controls = {
-        data_model_id: data_model_control_targets(
-            client.get_spec(DATA_MODEL, data_model_id)
-        )
-        for data_model_id in live
-    }
+    parameters = find_source_parameters(document.content)
+    controls = {}
+    for data_model_id in live:
+        model, _ = unwrap_document(client.get_spec(DATA_MODEL, data_model_id))
+        controls[data_model_id] = data_model_control_targets(model)
     findings = plan_repairs(
         parameters, live, controls, control_renames, preferred_data_model_id
     )
-    return Analysis(kind, spec, live, findings, parameters, controls)
+    return Analysis(document, live, findings, parameters, controls)
 
 
 def _print_report(analysis: Analysis) -> None:
-    spec = analysis.spec
-    print(f"{analysis.kind}: {spec.get('name')}  "
-          f"(version {spec.get('documentVersion')})")
+    document = analysis.document
+    print(f"{analysis.kind}: {document.name}  (version {document.version})")
     print(f"reads from: {', '.join(analysis.live) if analysis.live else '(none)'}")
     print(f"source parameters: {len(analysis.findings)}")
     if not analysis.findings:
@@ -722,7 +778,7 @@ def _emit_json(document_id: str, analysis: Analysis, **extra: Any) -> None:
     print(json.dumps(
         {
             "documentKind": analysis.kind,
-            "document": analysis.spec.get("name"),
+            "document": analysis.document.name,
             "documentId": document_id,
             "liveDataModelIds": analysis.live,
             "summary": _summary(analysis.findings),
@@ -836,11 +892,11 @@ def cmd_repair(client: SigmaClient, args: argparse.Namespace) -> int:
         return EXIT_OK
 
     changed = apply_repairs(analysis.findings)
+    layout_before = analysis.document.layout
     try:
-        client.update_spec(
-            analysis.kind, args.document_id,
-            spec_to_update_body(analysis.spec, analysis.kind),
-        )
+        # The document is written back whole, so layout and every other field
+        # survive; only the bindings were mutated, in place.
+        client.write_document(analysis.document)
     except SigmaError as exc:
         explanation = explain_rejection(
             str(exc), analysis.parameters, analysis.controls
@@ -851,15 +907,21 @@ def cmd_repair(client: SigmaClient, args: argparse.Namespace) -> int:
 
     after, _ = _prepare(client, args)
     still_broken = [f for f in after.findings if f.needs_attention]
+    layout_kept = after.document.layout == layout_before
     if args.json:
         _emit_json(args.document_id, after, applied=True, repaired=changed,
                    stillNeedingAttention=len(still_broken),
-                   appliedMappings=renames)
+                   layoutUnchanged=layout_kept, appliedMappings=renames)
     else:
         print(f"Applied — rewrote {changed} binding(s). A new version was created; "
               f"the previous one is still available in Sigma.")
         print(f"Verified — {len(still_broken)} source parameter(s) still need "
               f"attention.")
+        if layout_kept:
+            print("Verified — the layout is byte-identical; nothing moved.")
+        else:
+            print("WARNING — the layout changed. Elements may have moved; the "
+                  "previous version is still available in Sigma.", file=sys.stderr)
     return EXIT_FINDINGS if still_broken else EXIT_OK
 
 

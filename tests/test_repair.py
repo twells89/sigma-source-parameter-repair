@@ -16,7 +16,6 @@ from sigma_source_params import (  # noqa: E402
     find_source_parameters,
     iter_elements,
     plan_repairs,
-    spec_to_update_body,
 )
 
 OLD_DM = "11111111-1111-1111-1111-111111111111"
@@ -217,31 +216,6 @@ class TestApplyRepairs(unittest.TestCase):
         again = plan_repairs(find_source_parameters(spec), [NEW_DM], controls)
         self.assertEqual(again[0].status, HEALTHY)
         self.assertEqual(apply_repairs(again), 0)
-
-
-class TestSpecToUpdateBody(unittest.TestCase):
-    def test_drops_read_only_metadata(self):
-        spec = dict(
-            workbook(control("c1", "RegionControl", NEW_DM, "Store-Region")),
-            workbookId="abc",
-            name="Example",
-            documentVersion=7,
-            ownerId="someone",
-            createdAt="2026-01-01T00:00:00.000Z",
-            layout="<Page/>",
-        )
-        body = spec_to_update_body(spec)
-        self.assertEqual(set(body), {"schemaVersion", "pages", "layout"})
-
-    def test_keeps_theme_fields_when_present(self):
-        spec = dict(workbook(), themeName="Dark", themeOverrides={"a": 1})
-        body = spec_to_update_body(spec)
-        self.assertEqual(body["themeName"], "Dark")
-        self.assertEqual(body["themeOverrides"], {"a": 1})
-
-    def test_omits_absent_optional_fields(self):
-        body = spec_to_update_body(workbook())
-        self.assertEqual(set(body), {"schemaVersion", "pages"})
 
 
 if __name__ == "__main__":
