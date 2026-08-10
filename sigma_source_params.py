@@ -42,7 +42,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # Exit codes, chosen so `check` works as a CI gate.
 EXIT_OK = 0
@@ -103,15 +103,31 @@ class SourceParameter:
     """
 
 
+def iter_document_elements(spec: dict) -> Iterator[dict]:
+    """Every element in a document, from wherever the API puts them.
+
+    Elements moved from a per-page `pages[].elements` array to a single flat
+    `document.elements`; pages now carry only `{id, name}`. Both are read, so
+    this works across the change and against documents saved either way.
+    """
+    roots = []
+    if isinstance(spec.get("elements"), list):
+        roots.append(spec["elements"])
+    for page in spec.get("pages") or []:
+        if isinstance(page, dict) and isinstance(page.get("elements"), list):
+            roots.append(page["elements"])
+    for root in roots:
+        yield from iter_elements(root)
+
+
 def element_source_map(spec: dict) -> dict[str, str]:
     """Element id -> the data-model element it reads. Works for either doc type."""
     sources = {}
-    for page in spec.get("pages") or []:
-        for element in iter_elements(page.get("elements")):
-            source = element.get("source") or {}
-            if (source.get("kind") == "data-model" and element.get("id")
-                    and source.get("elementId")):
-                sources[element["id"]] = source["elementId"]
+    for element in iter_document_elements(spec):
+        source = element.get("source") or {}
+        if (source.get("kind") == "data-model" and element.get("id")
+                and source.get("elementId")):
+            sources[element["id"]] = source["elementId"]
     return sources
 
 
@@ -130,47 +146,46 @@ def find_source_parameters(spec: dict) -> list[SourceParameter]:
     """Collect every data-model source parameter in a workbook or model spec."""
     sources = element_source_map(spec)
     found: list[SourceParameter] = []
-    for page in spec.get("pages") or []:
-        for element in iter_elements(page.get("elements")):
-            if element.get("kind") != "control":
+    for element in iter_document_elements(spec):
+        if element.get("kind") != "control":
+            continue
+        value_source = _control_value_source(element)
+        for param in element.get("parameters") or []:
+            if not isinstance(param, dict) or param.get("kind") != "data-model":
                 continue
-            value_source = _control_value_source(element)
-            for param in element.get("parameters") or []:
-                if not isinstance(param, dict) or param.get("kind") != "data-model":
-                    continue
-                name = (element.get("name") or element.get("controlId") or "").strip()
-                found.append(
-                    SourceParameter(
-                        element_id=element.get("id", ""),
-                        element_name=name,
-                        own_control_id=element.get("controlId", ""),
-                        data_model_id=param.get("dataModelId", ""),
-                        dm_control_id=param.get("controlId", ""),
-                        raw=param,
-                        source_dm_element_id=sources.get(value_source),
-                        has_value_source=value_source is not None,
-                    )
+            name = (element.get("name") or element.get("controlId") or "").strip()
+            found.append(
+                SourceParameter(
+                    element_id=element.get("id", ""),
+                    element_name=name,
+                    own_control_id=element.get("controlId", ""),
+                    data_model_id=param.get("dataModelId", ""),
+                    dm_control_id=param.get("controlId", ""),
+                    raw=param,
+                    source_dm_element_id=sources.get(value_source),
+                    has_value_source=value_source is not None,
                 )
+            )
     return found
 
 
-def count_elements(spec: dict) -> tuple[int, int]:
-    """(pages, control elements) — used to tell an empty result from a misread one."""
-    pages = spec.get("pages") or []
-    controls = sum(
-        1 for page in pages for e in iter_elements(page.get("elements"))
-        if e.get("kind") == "control"
-    )
-    return len(pages), controls
+def count_elements(spec: dict) -> tuple[int, int, int]:
+    """(pages, elements, control elements) — to tell an empty result from a misread.
+
+    Counting elements separately from pages matters: elements moved out of
+    `pages[]` once already, and a reader that misses them would otherwise report
+    a confident zero.
+    """
+    elements = list(iter_document_elements(spec))
+    controls = sum(1 for e in elements if e.get("kind") == "control")
+    return len(spec.get("pages") or []), len(elements), controls
 
 
 def data_model_control_targets(dm_spec: dict) -> dict[str, str | None]:
     """Control id -> the data-model element that control filters."""
     targets: dict[str, str | None] = {}
-    for page in dm_spec.get("pages") or []:
-        for element in iter_elements(page.get("elements")):
-            if element.get("kind") != "control" or not element.get("controlId"):
-                continue
+    for element in iter_document_elements(dm_spec):
+        if element.get("kind") == "control" and element.get("controlId"):
             target = None
             for filt in element.get("filters") or []:
                 target = (filt.get("source") or {}).get("elementId")
@@ -742,6 +757,7 @@ class Analysis:
     parameters: list[SourceParameter]
     controls: dict[str, dict[str, str | None]]
     page_count: int = 0
+    element_count: int = 0
     control_count: int = 0
 
     @property
@@ -767,9 +783,9 @@ def analyze(
     findings = plan_repairs(
         parameters, live, controls, control_renames, preferred_data_model_id
     )
-    pages, control_elements = count_elements(document.content)
+    pages, elements, control_elements = count_elements(document.content)
     return Analysis(document, live, findings, parameters, controls,
-                    pages, control_elements)
+                    pages, elements, control_elements)
 
 
 def _print_report(analysis: Analysis) -> None:
@@ -780,6 +796,7 @@ def _print_report(analysis: Analysis) -> None:
     if not analysis.findings:
         print()
         for line in empty_result_note(analysis.kind, analysis.page_count,
+                                      analysis.element_count,
                                       analysis.control_count):
             print(line)
         return
@@ -806,24 +823,31 @@ def _print_report(analysis: Analysis) -> None:
         print()
 
 
-def empty_result_note(kind: str, pages: int, controls: int) -> list[str]:
+def empty_result_note(kind: str, pages: int, elements: int,
+                      controls: int) -> list[str]:
     """Explain a zero result, so a misread response cannot look like a clean bill.
 
     A silent zero is the worst failure this tool can have: as a rollout gate it
-    would wave a broken document straight through. Say what was actually seen.
+    would wave a broken document straight through. Say what was actually seen,
+    and treat "no elements at all" as a misread rather than an empty document —
+    elements have already moved once, from `pages[]` to the document root.
     """
+    unread = (
+        "That almost certainly means this version does not understand the "
+        "shape the API returned, rather than that the document is empty.",
+        f"Check for a newer release — this is {__version__}.",
+    )
     if pages == 0:
-        return [
-            "No pages were found in the API response.",
-            "That almost certainly means this version does not understand the "
-            "shape the API returned, rather than that the document is empty.",
-            f"Check for a newer release — this is {__version__}.",
-        ]
+        return ["No pages were found in the API response.", *unread]
+    if elements == 0:
+        return [f"Scanned {pages} page(s) but found no elements anywhere.",
+                *unread]
     if controls == 0:
-        return [f"Scanned {pages} page(s); this {kind} has no control elements, "
-                f"so there is nothing that could carry a source parameter."]
-    return [f"Scanned {pages} page(s) and {controls} control element(s); none "
-            f"carries a data-model source parameter.",
+        return [f"Scanned {pages} page(s) and {elements} element(s); this "
+                f"{kind} has no controls, so there is nothing that could carry "
+                f"a source parameter."]
+    return [f"Scanned {pages} page(s), {elements} element(s) and {controls} "
+            f"control(s); none carries a data-model source parameter.",
             "If you expect one here, check that this version is current — "
             f"this is {__version__}."]
 
@@ -843,6 +867,7 @@ def _emit_json(document_id: str, analysis: Analysis, **extra: Any) -> None:
             "documentId": document_id,
             "liveDataModelIds": analysis.live,
             "pagesScanned": analysis.page_count,
+            "elementsScanned": analysis.element_count,
             "controlElements": analysis.control_count,
             "summary": _summary(analysis.findings),
             "findings": [f.to_dict() for f in analysis.findings],
@@ -901,7 +926,7 @@ def cmd_check(client: SigmaClient, args: argparse.Namespace) -> int:
             print("All source parameters resolve to a live source.")
             print("Whether Sigma accepts each target is only settled by a write; "
                   "run `repair --apply` to find out.")
-    if analysis.page_count == 0:
+    if analysis.page_count == 0 or analysis.element_count == 0:
         # Could not interpret the response. Never exit clean on that — as a gate
         # it would be indistinguishable from a healthy document.
         return EXIT_API

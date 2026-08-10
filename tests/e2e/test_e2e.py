@@ -239,7 +239,10 @@ def build_workbook(client: SigmaClient, dm_id: str, element_id: str,
     # An explicit layout, so the fixture actually exercises layout preservation.
     # Earlier fixtures had none, which is why a layout-destroying write went
     # unnoticed by this test.
-    rows = [f'    <LayoutElement elementId="{e["id"]}" '
+    # The current workbook contract: elements live in a flat `document.elements`,
+    # pages carry only {id, name}, every element must be placed in the layout,
+    # and the layout tag is <Element> (an unknown tag returns an opaque error).
+    rows = [f'    <Element elementId="{e["id"]}" '
             f'gridColumn="1 / 13" gridRow="{i * 3 + 1} / {i * 3 + 4}"/>'
             for i, e in enumerate(elements)]
     layout = ('<?xml version="1.0" encoding="utf-8"?>\n'
@@ -253,7 +256,8 @@ def build_workbook(client: SigmaClient, dm_id: str, element_id: str,
             "kind": "workbook",
             "schemaVersion": 1,
             "layout": layout,
-            "pages": [{"id": "e2ePage01", "name": "Page 1", "elements": elements}],
+            "pages": [{"id": "e2ePage01", "name": "Page 1"}],
+            "elements": elements,
         },
     )
 

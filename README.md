@@ -65,6 +65,8 @@ Point it at a **workbook or a data model** — either the UUID or the short url 
 
 Data models carry source parameters in the identical `parameters[]` shape (a model's control driving a control in its upstream model), so the same breakage and the same repair apply one level up the stack.
 
+The tool reads elements from both places the API has put them — the current flat `document.elements` and the older per-page `pages[].elements` — so it works across that change and against documents saved either way.
+
 ### Check
 
 Report on a workbook without changing anything. Exits `1` if any binding needs attention, so it works as a pipeline gate.
