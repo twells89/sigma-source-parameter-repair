@@ -188,6 +188,28 @@ Sending `layout` to a data model is rejected, and reading `sources` as a bare
 list silently yields no live sources for a model — which would make every
 binding look unresolvable.
 
+## Elements moved out of pages
+
+Elements used to live in a per-page `pages[].elements` array. They now live in a
+single flat **`document.elements`**, and `pages[]` carries only `{id, name}`.
+Data models have not made this change — they still nest per page.
+
+```
+workbook    document: {kind, layout, schemaVersion, pages: [{id, name}], elements: [...]}
+data model  {kind, schemaVersion, pages: [{id, name, elements: [...]}]}
+```
+
+Two more parts of the same change, relevant to anyone writing specs rather than
+just reading them: every element must be **placed in the layout**, and the layout
+tag is now `<Element>` (previously `<LayoutElement>`), with `<Container>`
+replacing `<GridContainer>`. An unrecognised tag does not produce a validation
+message — it returns an opaque incident-id error that reads like an outage.
+
+`iter_document_elements()` reads both locations, so the tool works across the
+change and against documents saved either way. This is the second time elements
+have moved; the empty-result guard treats "pages but no elements" as a misread
+rather than an empty document precisely because of it.
+
 ## Nested elements
 
 Controls are often nested inside container elements, and containers can nest arbitrarily. A flat iteration over `page["elements"]` silently misses them, which in this problem space means silently under-reporting broken parameters. `iter_elements()` walks the tree, descending through both `elements` and `children`.
