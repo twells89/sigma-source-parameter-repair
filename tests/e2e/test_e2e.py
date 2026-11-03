@@ -110,21 +110,28 @@ def statuses(payload: dict) -> dict[str, str]:
 
 def post_spec(client: SigmaClient, kind: str, name: str, folder_id: str,
               document: dict) -> str:
-    """Create a workbook or data model, tolerating either body shape.
+    """Create a workbook or data model.
 
-    Workbooks moved to a `document` wrapper; data models have not. Rather than
-    hard-code which is which, try wrapped and fall back to flat on a shape error.
+    Workbooks are created with `POST /v2/workbooks` (the document goes in
+    `contents`; the /spec endpoint is deprecated). Data models still use
+    `POST /v2/dataModels/spec` and have not moved to a wrapper: rather than
+    hard-code the body shape, try wrapped and fall back to flat on a shape error.
     """
     base = "workbooks" if kind == WORKBOOK else "dataModels"
     key = "workbookId" if kind == WORKBOOK else "dataModelId"
-    attempts = [
-        {"name": name, "folderId": folder_id, "document": document},
-        {"name": name, "folderId": folder_id, **document},
-    ]
+    if kind == WORKBOOK:
+        path = "/v2/workbooks"
+        attempts = [{"name": name, "folderId": folder_id, "contents": document}]
+    else:
+        path = "/v2/dataModels/spec"
+        attempts = [
+            {"name": name, "folderId": folder_id, "document": document},
+            {"name": name, "folderId": folder_id, **document},
+        ]
     last = None
     for body in attempts:
         try:
-            created = client.call("POST", f"/v2/{base}/spec", body)
+            created = client.call("POST", path, body)
         except SigmaError as exc:
             # Either shape can be the wrong one, and the endpoints disagree on
             # how they say so ("Expecting { schemaVersion: 1 } at 0.document"

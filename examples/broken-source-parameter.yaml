@@ -1,7 +1,7 @@
 # A minimal illustration of the problem this tool solves.
 #
 # This is an excerpt of a workbook spec as returned by
-#   GET /v2/workbooks/{workbookId}/spec
+#   GET /v2/workbooks/{workbookId}?includeContents=true   (the `contents` part)
 # shortly after the workbook was re-pointed at a cloned data model.
 #
 # The workbook now READS FROM        22222222-2222-2222-2222-222222222222

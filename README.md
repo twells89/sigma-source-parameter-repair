@@ -224,7 +224,7 @@ If your template renames controls between versions, keep the renames in a file n
 
 ## A useful side effect
 
-Sigma's write path validates source parameters. `POST /v2/workbooks/spec` and `PUT /v2/workbooks/{id}/spec` reject a stale binding with a message naming the exact offender:
+Sigma's write path validates source parameters. `POST /v2/workbooks` (and its `dryRun`) and `PUT /v2/workbooks/{id}/contents` reject a stale binding with a message naming the exact offender:
 
 ```json
 {

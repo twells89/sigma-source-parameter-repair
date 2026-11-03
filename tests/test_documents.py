@@ -79,6 +79,11 @@ class TestUnwrapDocument(unittest.TestCase):
     WRAPPED = {
         "workbookId": "wb1", "name": "X", "documentVersion": 4,
         "createdAt": "2026-01-01", "url": "https://example.invalid",
+        "contents": {"kind": "workbook", "schemaVersion": 1,
+                     "layout": "<Page/>", "pages": []},
+    }
+    LEGACY_WRAPPED = {
+        "workbookId": "wb1", "name": "X", "documentVersion": 4,
         "document": {"kind": "workbook", "schemaVersion": 1,
                      "layout": "<Page/>", "pages": []},
     }
@@ -97,7 +102,12 @@ class TestUnwrapDocument(unittest.TestCase):
         envelope = json.loads(json.dumps(self.WRAPPED))
         content, _ = unwrap_document(envelope)
         content["pages"].append({"id": "new"})
-        self.assertEqual(envelope["document"]["pages"], [{"id": "new"}])
+        self.assertEqual(envelope["contents"]["pages"], [{"id": "new"}])
+
+    def test_the_deprecated_document_wrapper_is_still_read(self):
+        content, wrapped = unwrap_document(self.LEGACY_WRAPPED)
+        self.assertTrue(wrapped)
+        self.assertEqual(content["kind"], "workbook")
 
     def test_flat_strips_only_read_only_metadata(self):
         content, wrapped = unwrap_document(self.FLAT)
@@ -110,11 +120,44 @@ class TestUnwrapDocument(unittest.TestCase):
         self.assertEqual(content["somethingNew"], {"a": 1})
 
 
+class TestEndpoints(unittest.TestCase):
+    """Workbooks use /v2/workbooks (the /spec endpoints are deprecated); data
+    models are unchanged."""
+
+    def test_a_workbook_is_read_with_includecontents_and_written_to_contents(self):
+        client = FakeClient({
+            "/v2/workbooks/wb1?includeContents=true": TestUnwrapDocument.WRAPPED,
+            "/v2/workbooks/wb1/sources": {"entries": []},
+            "/v2/workbooks/wb1/contents": {"workbookId": "wb1"},
+        })
+        document = client.get_document(WORKBOOK, "wb1")
+        self.assertTrue(document.wrapped)
+        self.assertEqual(document.version, 4)
+        client.write_document(document)
+        self.assertEqual(
+            client.calls,
+            [("GET", "/v2/workbooks/wb1?includeContents=true"),
+             ("PUT", "/v2/workbooks/wb1/contents")],
+        )
+
+    def test_a_data_model_still_uses_its_spec_endpoints(self):
+        client = FakeClient({"/v2/dataModels/dm1/spec?format=json": TestUnwrapDocument.FLAT,
+                             "/v2/dataModels/dm1/spec": {}})
+        document = client.get_document(DATA_MODEL, "dm1")
+        self.assertFalse(document.wrapped)
+        client.write_document(document)
+        self.assertEqual(
+            client.calls,
+            [("GET", "/v2/dataModels/dm1/spec?format=json"),
+             ("PUT", "/v2/dataModels/dm1/spec")],
+        )
+
+
 class TestDocumentForWrite(unittest.TestCase):
     DOC = {"kind": "workbook", "schemaVersion": 1, "layout": "<Page/>", "pages": []}
 
-    def test_wrapped_document_is_nested_for_the_write(self):
-        self.assertEqual(document_for_write(self.DOC, True), {"document": self.DOC})
+    def test_wrapped_document_is_nested_as_contents_for_the_write(self):
+        self.assertEqual(document_for_write(self.DOC, True), {"contents": self.DOC})
 
     def test_flat_document_is_sent_as_is(self):
         self.assertEqual(document_for_write(self.DOC, False), self.DOC)
@@ -124,20 +167,20 @@ class TestDocumentForWrite(unittest.TestCase):
         every element on the page. So the document goes back whole."""
         for wrapped in (True, False):
             body = document_for_write(self.DOC, wrapped)
-            sent = body["document"] if wrapped else body
+            sent = body["contents"] if wrapped else body
             self.assertEqual(sent["layout"], "<Page/>")
 
     def test_kind_is_never_dropped(self):
         """`kind` is required — a write without it is rejected."""
         for wrapped in (True, False):
             body = document_for_write(self.DOC, wrapped)
-            sent = body["document"] if wrapped else body
+            sent = body["contents"] if wrapped else body
             self.assertIn("kind", sent)
 
     def test_nothing_is_filtered_out(self):
         doc = {**self.DOC, "themeName": "Dark", "futureField": 7}
         body = document_for_write(doc, True)
-        self.assertEqual(body["document"], doc)
+        self.assertEqual(body["contents"], doc)
 
 
 class TestSourcesShape(unittest.TestCase):
