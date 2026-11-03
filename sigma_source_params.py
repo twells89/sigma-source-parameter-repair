@@ -426,25 +426,28 @@ ENVELOPE_METADATA = frozenset({
 def unwrap_document(envelope: dict) -> tuple[dict, bool]:
     """Split a GET response into (writable document, was it wrapped).
 
-    Workbooks nest the document under a `document` key; data models return it
-    flat alongside read-only metadata. Returns the live inner dict — mutating
-    its `pages` in place is reflected in what gets written back.
+    Workbooks nest the document under a `contents` key (the deprecated /spec
+    endpoints used `document`, still accepted here); data models return it flat
+    alongside read-only metadata. Returns the live inner dict — mutating its
+    `pages` in place is reflected in what gets written back.
     """
-    document = envelope.get("document")
-    if isinstance(document, dict):
-        return document, True
+    for key in ("contents", "document"):
+        document = envelope.get(key)
+        if isinstance(document, dict):
+            return document, True
     return {k: v for k, v in envelope.items() if k not in ENVELOPE_METADATA}, False
 
 
 def document_for_write(document: dict, wrapped: bool) -> dict:
-    """Wrap the document for the write endpoint, unchanged.
+    """Wrap the document for the write endpoint, unchanged: `contents` for a
+    workbook (PUT /v2/workbooks/{id}/contents), flat for a data model.
 
     The document is sent back **whole**. Cherry-picking known fields is how
     layout gets lost: a body that omits `layout` is accepted and Sigma
     regenerates it, which moves every element on the page. `kind` is likewise
     required, and was not a field this tool originally knew about.
     """
-    return {"document": document} if wrapped else dict(document)
+    return {"contents": document} if wrapped else dict(document)
 
 
 # --------------------------------------------------------------------------
@@ -672,7 +675,7 @@ class SigmaClient:
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            return raw  # the spec write endpoints answer in YAML
+            return raw  # a non-JSON answer is returned as text
 
     _call = call  # kept for callers written against the old private name
 
@@ -694,14 +697,25 @@ class SigmaClient:
     def _base(self, kind: str) -> str:
         return "workbooks" if kind == WORKBOOK else "dataModels"
 
+    # Workbooks use the code-rep endpoints on /v2/workbooks (the /spec ones are
+    # deprecated, OpenAPI 2.0.0+20261030); data models still use /spec.
+
+    def read_path(self, kind: str, document_id: str) -> str:
+        if kind == WORKBOOK:
+            return f"/v2/workbooks/{document_id}?includeContents=true"
+        return f"/v2/dataModels/{document_id}/spec?format=json"
+
+    def write_path(self, kind: str, document_id: str) -> str:
+        if kind == WORKBOOK:
+            return f"/v2/workbooks/{document_id}/contents"
+        return f"/v2/dataModels/{document_id}/spec"
+
     def get_spec(self, kind: str, document_id: str) -> dict:
         """The raw GET response — envelope and all."""
-        return self.call(
-            "GET", f"/v2/{self._base(kind)}/{document_id}/spec?format=json"
-        )
+        return self.call("GET", self.read_path(kind, document_id))
 
     def update_spec(self, kind: str, document_id: str, body: dict) -> Any:
-        return self.call("PUT", f"/v2/{self._base(kind)}/{document_id}/spec", body)
+        return self.call("PUT", self.write_path(kind, document_id), body)
 
     def get_document(self, kind: str, document_id: str) -> "Document":
         envelope = self.get_spec(kind, document_id)

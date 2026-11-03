@@ -65,7 +65,7 @@ class TestParseInvalidParameter(unittest.TestCase):
         )
 
     def test_tolerates_a_wrapping_http_prefix(self):
-        wrapped = f"HTTP 400 on PUT /v2/workbooks/abc/spec\n{MESSAGE}"
+        wrapped = f"HTTP 400 on PUT /v2/workbooks/abc/contents\n{MESSAGE}"
         self.assertEqual(
             parse_invalid_parameter(wrapped)["controlId"], "Store-City"
         )

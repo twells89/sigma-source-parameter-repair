@@ -61,24 +61,24 @@ The practical consequence is that all the stale bindings in a freshly swapped wo
 | Call | Purpose |
 | --- | --- |
 | `POST /v2/auth/token` | Exchange client credentials for a bearer token (~1h TTL) |
-| `GET /v2/workbooks/{id}/spec?format=json` | Read the workbook's code representation |
+| `GET /v2/workbooks/{id}?includeContents=true` | Read the workbook's code representation (the document is under `contents`) |
 | `GET /v2/workbooks/{id}/sources` | List what the workbook actually reads from now |
 | `GET /v2/dataModels/{id}/spec?format=json` | Read a data model, to enumerate its control ids |
-| `PUT /v2/workbooks/{id}/spec` | Write the repaired workbook |
+| `PUT /v2/workbooks/{id}/contents` | Write the repaired workbook |
 
 ### The document envelope, and why layout gets lost
 
 `GET` returns read-only metadata around the document. **Workbooks nest the
-document under a `document` key; data models return it flat.** Both carry a
-`kind` field.
+document under a `contents` key (the deprecated `/spec` endpoints called it
+`document`); data models return it flat.** Both carry a `kind` field.
 
 ```
-workbook   {workbookId, name, url, documentVersion, ..., document: {kind, layout, pages, schemaVersion}}
+workbook   {workbookId, name, url, documentVersion, ..., contents: {kind, layout, pages, schemaVersion}}
 data model {dataModelId, name, url, documentVersion, ..., kind, pages, schemaVersion}
 ```
 
-Writes mirror that: a workbook `PUT` body is `{"document": {...}}` and a flat one
-is rejected with `Expecting { schemaVersion: 1 } at 0.document`; a data model
+Writes mirror that: a workbook `PUT /contents` body is `{"contents": {...}}` and a flat one
+is rejected (the `/spec` endpoint said `Expecting { schemaVersion: 1 } at 0.document`); a data model
 takes the document flat and rejects the wrapper with `Syntax error in data model
 spec`.
 
@@ -117,7 +117,7 @@ HTTP 400
 }
 ```
 
-This makes the write path a reliable oracle for whether a workbook's source parameters are sound, and it is why cloning a broken workbook via `POST /v2/workbooks/spec` fails until the bindings are repaired.
+This makes the write path a reliable oracle for whether a workbook's source parameters are sound, and it is why cloning a broken workbook via `POST /v2/workbooks` fails until the bindings are repaired.
 
 `GET` does not validate. It returns stale bindings without complaint, so read-back alone cannot tell you a workbook is healthy — it only tells you what the workbook currently claims.
 
@@ -180,7 +180,7 @@ and a source swap breaks it the same way. Endpoint differences:
 
 | | Workbook | Data model |
 | --- | --- | --- |
-| spec | `/v2/workbooks/{id}/spec` | `/v2/dataModels/{id}/spec` |
+| spec | `GET /v2/workbooks/{id}?includeContents=true`, `PUT /v2/workbooks/{id}/contents` | `/v2/dataModels/{id}/spec` |
 | `PUT` body | `schemaVersion`, `pages`, `layout`, theme | `schemaVersion`, `pages` **only** |
 | sources | bare JSON array | `{"entries": [...]}` |
 
@@ -191,11 +191,11 @@ binding look unresolvable.
 ## Elements moved out of pages
 
 Elements used to live in a per-page `pages[].elements` array. They now live in a
-single flat **`document.elements`**, and `pages[]` carries only `{id, name}`.
+single flat **`contents.elements`**, and `pages[]` carries only `{id, name}`.
 Data models have not made this change — they still nest per page.
 
 ```
-workbook    document: {kind, layout, schemaVersion, pages: [{id, name}], elements: [...]}
+workbook    contents: {kind, layout, schemaVersion, pages: [{id, name}], elements: [...]}
 data model  {kind, schemaVersion, pages: [{id, name, elements: [...]}]}
 ```
 
